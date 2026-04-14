@@ -264,12 +264,48 @@ def load_house_trades(fmp_key: str = "") -> pd.DataFrame:
     raise ConnectionError("Cámara — todas las fuentes fallaron:\n" + "\n".join(errors))
 
 
+def _robust_parse_date(series: pd.Series) -> pd.Series:
+    """
+    Intenta parsear fechas en múltiples formatos comunes de los datos del Congreso.
+    Formatos conocidos:
+      - MM/DD/YYYY   (GitHub Senate Stock Watcher)
+      - YYYY-MM-DD   (FMP API)
+      - MM/DD/YY     (algunos registros históricos)
+    """
+    # Primero intentar el formato estándar ISO
+    result = pd.to_datetime(series, errors="coerce", dayfirst=False)
+
+    # Para los que fallaron (NaT), intentar formato MM/DD/YYYY explícitamente
+    nat_mask = result.isna()
+    if nat_mask.any():
+        fallback = pd.to_datetime(
+            series[nat_mask].astype(str).str.strip().str.replace(r'\s+', ' ', regex=True),
+            format="%m/%d/%Y",
+            errors="coerce"
+        )
+        result = result.copy()
+        result[nat_mask] = fallback
+
+    # Segundo fallback: MM/DD/YY
+    nat_mask2 = result.isna()
+    if nat_mask2.any():
+        fallback2 = pd.to_datetime(
+            series[nat_mask2].astype(str).str.strip(),
+            format="%m/%d/%y",
+            errors="coerce"
+        )
+        result = result.copy()
+        result[nat_mask2] = fallback2
+
+    return result
+
+
 def normalize_congressional(df: pd.DataFrame) -> pd.DataFrame:
     """Limpia y normaliza columnas del DataFrame del Congreso."""
-    # Parsear fechas
+    # Parsear fechas con parser robusto multi-formato
     for col in ["transaction_date", "disclosure_date"]:
         if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=False)
+            df[col] = _robust_parse_date(df[col].astype(str).replace("--", pd.NaT).replace("N/A", pd.NaT))
 
     # Tipo de operación legible
     if "trade_type" in df.columns:
@@ -518,9 +554,7 @@ def load_insider_trades() -> pd.DataFrame:
         if all_trades:
             df = pd.DataFrame(all_trades)
             if "transaction_date" in df.columns:
-                df["transaction_date"] = pd.to_datetime(
-                    df["transaction_date"], errors="coerce", dayfirst=False
-                )
+                df["transaction_date"] = _robust_parse_date(df["transaction_date"].astype(str))
             df["chamber"] = df["title"].fillna("N/D")
             return df
 
@@ -687,7 +721,7 @@ def main():
             "Período de tiempo",
             ["Últimos 7 días", "Últimos 30 días", "Últimos 90 días",
              "Último año", "Todo el historial"],
-            index=1,
+            index=3,  # Default: Último año (evita perder datos por fechas mal parseadas)
         )
 
         tipo_op = st.multiselect(
@@ -723,9 +757,15 @@ def main():
         if "Políticos (Congreso)" not in fuentes:
             st.info("Activa **Políticos (Congreso)** en el panel de filtros para ver estos datos.")
         else:
-            # Leer clave FMP de Streamlit Secrets (opcional pero recomendado para House data)
+            # ── Leer clave FMP SOLO si está explícitamente configurada ────────
+            # FMP es OPCIONAL — solo para datos de la Cámara de Representantes.
+            # Si no está configurada, el sistema usa solo datos del Senado (que sí funcionan).
+            fmp_key = ""
             try:
-                fmp_key = st.secrets.get("FMP_API_KEY", "")
+                raw_key = st.secrets.get("FMP_API_KEY", "")
+                # Validar que sea una clave real (mínimo 20 caracteres alfanuméricos)
+                if raw_key and isinstance(raw_key, str) and len(raw_key.strip()) >= 20:
+                    fmp_key = raw_key.strip()
             except Exception:
                 fmp_key = ""
 
@@ -733,55 +773,51 @@ def main():
                 df_h, df_s = pd.DataFrame(), pd.DataFrame()
                 errors_cong = []
 
+                # Senado siempre se intenta (fuente GitHub gratuita)
                 try:
                     df_s = load_senate_trades(fmp_key=fmp_key)
                 except Exception as e:
                     errors_cong.append(f"Senado: {str(e)[:200]}")
 
-                try:
-                    df_h = load_house_trades(fmp_key=fmp_key)
-                except Exception as e:
-                    errors_cong.append(f"Cámara: {str(e)[:200]}")
+                # Cámara solo si hay clave FMP válida (evita llamadas 401 inútiles)
+                if fmp_key:
+                    try:
+                        df_h = load_house_trades(fmp_key=fmp_key)
+                    except Exception as e:
+                        errors_cong.append(f"Cámara: {str(e)[:200]}")
 
                 if df_h.empty and df_s.empty:
-                    st.error("⚠️ No se pudieron cargar los datos del Congreso.")
-                    st.markdown("""
-**¿Cómo solucionarlo?**
-
-Los datos del **Senado** se cargan automáticamente desde GitHub (sin configuración). Si falla, puede ser un problema temporal — intenta recargar en unos minutos.
-
-Los datos de la **Cámara de Representantes** requieren una clave API gratuita de [Financial Modeling Prep](https://financialmodelingprep.com/register):
-
-1. Regístrate gratis en **[financialmodelingprep.com/register](https://financialmodelingprep.com/register)** (sin tarjeta de crédito)
-2. Copia tu API key del dashboard
-3. En Streamlit Cloud → tu app → ⚙️ **Settings** → **Secrets**
-4. Agrega esta línea (reemplazando `TU_CLAVE_AQUI`):
-   ```
-   FMP_API_KEY = "TU_CLAVE_AQUI"
-   ```
-5. Guarda y recarga la app — ¡listo!
-
-> El plan gratuito de FMP permite **250 llamadas/día**, más que suficiente para este dashboard.
-                    """)
+                    st.error("⚠️ No se pudieron cargar los datos del Senado.")
+                    st.info("Intenta recargar la página en unos minutos. Si el problema persiste, la fuente GitHub puede estar temporalmente caída.")
                     cong_ok = False
-                elif not fmp_key and df_h.empty:
-                    parts = [df for df in [df_s] if not df.empty]
-                    df_c = normalize_congressional(pd.concat(parts, ignore_index=True))
-                    cong_ok = True
-                    st.info(
-                        "ℹ️ Se cargaron datos del **Senado** correctamente. "
-                        "Para ver también la **Cámara de Representantes**, configura una clave gratuita de "
-                        "[Financial Modeling Prep](https://financialmodelingprep.com/register) "
-                        "en los Secrets de Streamlit. Ver pestaña **ℹ️ Acerca de** para instrucciones."
-                    )
                 else:
                     parts = [df for df in [df_h, df_s] if not df.empty]
                     df_c = normalize_congressional(pd.concat(parts, ignore_index=True))
                     cong_ok = True
-                    if errors_cong:
+                    # Mostrar banner de Cámara solo si no hay clave FMP
+                    if not fmp_key:
+                        st.info(
+                            "ℹ️ Mostrando datos del **Senado**. "
+                            "Para agregar la **Cámara de Representantes**, obtén una clave gratuita en "
+                            "[financialmodelingprep.com/register](https://financialmodelingprep.com/register) "
+                            "y agrégala en el código o en los Secrets de Streamlit."
+                        )
+                    elif errors_cong:
                         st.warning("⚠️ Datos parciales: " + " | ".join(errors_cong))
 
             if cong_ok and not df_c.empty:
+                total_loaded = len(df_c)
+
+                # ── Diagnóstico de fechas (ayuda a detectar problemas de parsing) ──
+                if "transaction_date" in df_c.columns:
+                    n_nat = df_c["transaction_date"].isna().sum()
+                    if n_nat > 0:
+                        pct = round(n_nat / total_loaded * 100, 1)
+                        st.warning(
+                            f"⚠️ {n_nat:,} de {total_loaded:,} registros ({pct}%) tienen fecha sin parsear — "
+                            "se mostrarán igual pero no se pueden filtrar por fecha."
+                        )
+
                 # ── Aplicar filtros ──────────────
                 mask = pd.Series([True] * len(df_c), index=df_c.index)
 
@@ -797,7 +833,14 @@ Los datos de la **Cámara de Representantes** requieren una clave API gratuita d
                 if nombre_input and "name" in df_c.columns:
                     mask &= df_c["name"].str.lower().str.contains(nombre_input, na=False)
 
-                df_f = df_c[mask].sort_values("transaction_date", ascending=False)
+                df_f = df_c[mask].sort_values("transaction_date", ascending=False, na_position="last")
+
+                # Si el filtro de fecha dejó 0 resultados pero había datos, avisar al usuario
+                if len(df_f) == 0 and total_loaded > 0:
+                    st.warning(
+                        f"ℹ️ Se cargaron **{total_loaded:,}** registros pero el filtro **{rango}** no mostró ninguno. "
+                        "Prueba a seleccionar **'Todo el historial'** en el selector de período."
+                    )
 
                 metric_row(df_f)
                 st.divider()
@@ -903,7 +946,14 @@ Los datos de la **Cámara de Representantes** requieren una clave API gratuita d
                 if nombre_input and "name" in df_ins.columns:
                     mask_i &= df_ins["name"].str.lower().str.contains(nombre_input, na=False)
 
-                df_fi = df_ins[mask_i].sort_values("transaction_date", ascending=False)
+                df_fi = df_ins[mask_i].sort_values("transaction_date", ascending=False, na_position="last")
+
+                if len(df_fi) == 0 and len(df_ins) > 0:
+                    st.warning(
+                        f"ℹ️ Se cargaron **{len(df_ins):,}** registros de insiders pero el filtro "
+                        f"**{rango}** no mostró ninguno. "
+                        "Prueba a seleccionar **'Todo el historial'** en el selector de período."
+                    )
 
                 metric_row(df_fi)
                 st.divider()
