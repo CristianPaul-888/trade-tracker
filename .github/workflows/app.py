@@ -41,213 +41,226 @@ HEADERS_SIMPLE = {
 }
 
 
-def safe_fetch_json(url: str, timeout: int = 60) -> list | dict:
+def safe_fetch_json(url: str, timeout: int = 60, extra_headers: dict | None = None) -> list | dict:
     """
     Descarga JSON de una URL con manejo robusto de errores.
     Intenta con HEADERS normales primero, luego con headers simples.
-    Lanza Exception con mensaje útil si falla.
+    Lanza ConnectionError con mensaje útil si falla.
     """
     last_error = ""
+    base_headers_list = [HEADERS, HEADERS_SIMPLE]
 
-    for attempt, hdrs in enumerate([HEADERS, HEADERS_SIMPLE], start=1):
+    for attempt, base_hdrs in enumerate(base_headers_list, start=1):
+        hdrs = {**base_hdrs, **(extra_headers or {})}
         try:
             r = requests.get(url, headers=hdrs, timeout=timeout)
 
-            # Si el servidor devuelve error HTTP, capturamos el status
+            if r.status_code == 401:
+                raise ConnectionError(f"Clave API inválida o falta autorización (HTTP 401) — {url}")
+            if r.status_code == 403:
+                last_error = f"Acceso denegado (HTTP 403) — {url}"
+                continue
             if r.status_code != 200:
-                last_error = f"HTTP {r.status_code} desde {url}"
+                last_error = f"HTTP {r.status_code} — {url}"
                 continue
 
-            # Verificar que la respuesta no esté vacía
             text = r.text.strip()
             if not text:
-                last_error = f"Respuesta vacía (intento {attempt})"
+                last_error = f"Respuesta vacía del servidor (intento {attempt})"
                 continue
 
-            # S3 a veces devuelve XML de error aunque el status sea 200
-            if text.startswith("<?xml") or text.startswith("<Error"):
-                # Extraer mensaje del XML si es posible
+            # S3 y algunos proxies devuelven XML de error con status 200
+            if text.startswith("<?xml") or text.startswith("<Error") or text.startswith("<html"):
                 try:
                     root = ET.fromstring(text)
                     code = root.findtext("Code", "")
                     msg  = root.findtext("Message", "")
                     last_error = f"Error S3 [{code}]: {msg}"
                 except Exception:
-                    last_error = f"Respuesta XML inesperada: {text[:120]}"
+                    last_error = f"Respuesta no-JSON: {text[:100]}"
                 continue
 
-            # Parsear JSON
             return r.json()
 
+        except ConnectionError:
+            raise  # Re-lanzar errores 401 inmediatamente
         except requests.exceptions.Timeout:
-            last_error = f"Timeout en intento {attempt}"
+            last_error = f"Timeout (intento {attempt})"
         except requests.exceptions.ConnectionError as e:
             last_error = f"Error de conexión: {str(e)[:80]}"
         except ValueError as e:
-            # JSONDecodeError cae aquí
-            last_error = f"Formato inválido: {str(e)}"
+            last_error = f"JSON inválido: {str(e)[:80]}"
 
-    raise ConnectionError(
-        f"No se pudo obtener datos de:\n{url}\n\nÚltimo error: {last_error}"
-    )
+    raise ConnectionError(f"No se pudo obtener datos de {url} — {last_error}")
 
 # ─────────────────────────────────────────────
 # CARGA DE DATOS DEL CONGRESO
 # ─────────────────────────────────────────────
 
-@st.cache_data(ttl=14400, show_spinner=False)
-def load_house_trades() -> pd.DataFrame:
+def _normalize_fmp_congress(data: list, chamber: str) -> pd.DataFrame:
     """
-    Carga trades de la Cámara de Representantes.
-    Intenta múltiples fuentes en orden hasta encontrar una que funcione.
-    TTL: 4 horas
+    Normaliza el formato JSON de Financial Modeling Prep (FMP) al esquema común.
+    FMP devuelve: firstName, lastName, symbol, type, amount, transactionDate, dateRecieved, assetDescription
     """
-    # Fuentes en orden de preferencia
-    SOURCES = [
-        "https://house-stock-watcher-data.s3-us-east-2.amazonaws.com/data/all_transactions.json",
-        "https://house-stock-watcher-data.s3.amazonaws.com/data/all_transactions.json",
-        "https://raw.githubusercontent.com/capitoltrades/capitoltrades-data/main/house_trades.json",
-    ]
-
-    data = None
-    errors = []
-    for url in SOURCES:
-        try:
-            data = safe_fetch_json(url, timeout=60)
-            if data:
-                break
-        except Exception as e:
-            errors.append(str(e)[:120])
-
-    if not data:
-        # Intentar con Quiver Quantitative (fuente alternativa gratuita)
-        try:
-            data = safe_fetch_json("https://api.quiverquant.com/beta/live/congresstrading", timeout=30)
-            if isinstance(data, list):
-                # Quiver filtra solo Cámara baja
-                data = [d for d in data if str(d.get("House", "")).strip().lower() == "house"]
-        except Exception as e:
-            errors.append(f"Quiver: {str(e)[:120]}")
-            data = None
-
-    if not data:
-        raise ConnectionError(
-            "No se pudieron cargar datos de la Cámara de Representantes.\n"
-            "Las fuentes externas pueden estar temporalmente no disponibles.\n"
-            "Errores: " + " | ".join(errors[-2:])
-        )
-
     df = pd.DataFrame(data)
 
-    # Normalizar nombre del político (el campo varía según la fuente)
-    for col in ["representative", "Politician", "owner"]:
-        if col in df.columns:
-            df = df.rename(columns={col: "name"})
-            break
+    # Construir nombre completo
+    if "firstName" in df.columns and "lastName" in df.columns:
+        df["name"] = (df["firstName"].fillna("") + " " + df["lastName"].fillna("")).str.strip()
+    elif "Politician" in df.columns:
+        df = df.rename(columns={"Politician": "name"})
 
-    # Normalizar tipo de operación
-    for col in ["type", "Transaction"]:
-        if col in df.columns:
-            df = df.rename(columns={col: "trade_type"})
-            break
+    # Ticker
+    if "symbol" in df.columns:
+        df = df.rename(columns={"symbol": "ticker"})
+    elif "Ticker" in df.columns:
+        df = df.rename(columns={"Ticker": "ticker"})
 
-    # Normalizar ticker
-    for col in ["ticker", "Ticker"]:
-        if col in df.columns and col != "ticker":
-            df = df.rename(columns={col: "ticker"})
-            break
+    # Tipo de operación
+    if "type" in df.columns:
+        df = df.rename(columns={"type": "trade_type"})
+    elif "Transaction" in df.columns:
+        df = df.rename(columns={"Transaction": "trade_type"})
 
-    # Normalizar monto
-    for col in ["amount", "Range"]:
-        if col in df.columns and col != "amount":
-            df = df.rename(columns={col: "amount"})
-            break
+    # Fechas
+    if "transactionDate" in df.columns:
+        df = df.rename(columns={"transactionDate": "transaction_date"})
+    elif "Date" in df.columns:
+        df = df.rename(columns={"Date": "transaction_date"})
 
-    # Normalizar fecha
-    for col in ["transaction_date", "Date"]:
-        if col in df.columns and col != "transaction_date":
-            df = df.rename(columns={col: "transaction_date"})
-            break
+    if "dateRecieved" in df.columns:
+        df = df.rename(columns={"dateRecieved": "disclosure_date"})
 
-    df["chamber"] = "Cámara de Representantes"
+    # Descripción del activo
+    if "assetDescription" in df.columns:
+        df = df.rename(columns={"assetDescription": "asset_description"})
+
+    # Estado / partido si existen
+    if "stateDist" in df.columns and "state" not in df.columns:
+        df = df.rename(columns={"stateDist": "state"})
+
+    df["chamber"] = chamber
     df["source"]  = "Político"
     return df
 
 
 @st.cache_data(ttl=14400, show_spinner=False)
-def load_senate_trades() -> pd.DataFrame:
+def load_senate_trades(fmp_key: str = "") -> pd.DataFrame:
     """
     Carga trades del Senado.
-    Intenta múltiples fuentes en orden hasta encontrar una que funcione.
+
+    Orden de fuentes:
+      1. GitHub Senate Stock Watcher (timothycarambat) — gratis, sin clave
+      2. Financial Modeling Prep (FMP) — 250 llamadas/día gratis, requiere clave
+      3. S3 House Stock Watcher (legado, puede estar caído)
     TTL: 4 horas
     """
-    SOURCES = [
+    errors = []
+
+    # ── 1. GitHub Senate Stock Watcher ────────────────────────────────────
+    # Mantenido por la comunidad. Actualizado continuamente con datos del STOCK Act.
+    GITHUB_URLS = [
+        "https://raw.githubusercontent.com/timothycarambat/senate-stock-watcher-data/master/aggregate/all_transactions.json",
+        "https://raw.githubusercontent.com/rdumont/senate-stock-watcher-data/master/aggregate/all_transactions.json",
+    ]
+    for url in GITHUB_URLS:
+        try:
+            data = safe_fetch_json(url, timeout=45)
+            if data and isinstance(data, list) and len(data) > 10:
+                df = pd.DataFrame(data)
+                if "senator" in df.columns:
+                    df = df.rename(columns={"senator": "name"})
+                elif "owner" in df.columns:
+                    df = df.rename(columns={"owner": "name"})
+                if "type" in df.columns:
+                    df = df.rename(columns={"type": "trade_type"})
+                df["chamber"] = "Senado"
+                df["source"]  = "Político"
+                return df
+        except Exception as e:
+            errors.append(f"GitHub Senate: {str(e)[:100]}")
+
+    # ── 2. Financial Modeling Prep API ────────────────────────────────────
+    # Requiere FMP_API_KEY en Streamlit Secrets (gratis en fmp.financialmodelingprep.com)
+    if fmp_key:
+        try:
+            data = safe_fetch_json(
+                f"https://financialmodelingprep.com/api/v4/senate-trading?apikey={fmp_key}",
+                timeout=30
+            )
+            if data and isinstance(data, list) and len(data) > 0:
+                return _normalize_fmp_congress(data, "Senado")
+        except Exception as e:
+            errors.append(f"FMP Senate: {str(e)[:100]}")
+
+    # ── 3. S3 legado ──────────────────────────────────────────────────────
+    for url in [
         "https://senate-stock-watcher-data.s3-us-east-2.amazonaws.com/aggregate/all_transactions.json",
         "https://senate-stock-watcher-data.s3.amazonaws.com/aggregate/all_transactions.json",
-    ]
+    ]:
+        try:
+            data = safe_fetch_json(url, timeout=30)
+            if data and isinstance(data, list):
+                df = pd.DataFrame(data)
+                if "senator" in df.columns:
+                    df = df.rename(columns={"senator": "name"})
+                if "type" in df.columns:
+                    df = df.rename(columns={"type": "trade_type"})
+                df["chamber"] = "Senado"
+                df["source"]  = "Político"
+                return df
+        except Exception as e:
+            errors.append(f"S3 Senate: {str(e)[:80]}")
 
-    data = None
+    raise ConnectionError("Senado — todas las fuentes fallaron:\n" + "\n".join(errors))
+
+
+@st.cache_data(ttl=14400, show_spinner=False)
+def load_house_trades(fmp_key: str = "") -> pd.DataFrame:
+    """
+    Carga trades de la Cámara de Representantes.
+
+    Orden de fuentes:
+      1. Financial Modeling Prep (FMP) — 250 llamadas/día gratis, requiere clave
+      2. S3 House Stock Watcher (legado, puede estar caído)
+    TTL: 4 horas
+    """
     errors = []
-    for url in SOURCES:
+
+    # ── 1. Financial Modeling Prep API ────────────────────────────────────
+    if fmp_key:
         try:
-            data = safe_fetch_json(url, timeout=60)
-            if data:
-                break
+            data = safe_fetch_json(
+                f"https://financialmodelingprep.com/api/v4/house-trading?apikey={fmp_key}",
+                timeout=30
+            )
+            if data and isinstance(data, list) and len(data) > 0:
+                return _normalize_fmp_congress(data, "Cámara de Representantes")
         except Exception as e:
-            errors.append(str(e)[:120])
+            errors.append(f"FMP House: {str(e)[:100]}")
 
-    if not data:
-        # Intentar con Quiver Quantitative
+    # ── 2. S3 legado ──────────────────────────────────────────────────────
+    for url in [
+        "https://house-stock-watcher-data.s3-us-east-2.amazonaws.com/data/all_transactions.json",
+        "https://house-stock-watcher-data.s3.amazonaws.com/data/all_transactions.json",
+    ]:
         try:
-            data = safe_fetch_json("https://api.quiverquant.com/beta/live/congresstrading", timeout=30)
-            if isinstance(data, list):
-                data = [d for d in data if str(d.get("House", "")).strip().lower() == "senate"]
+            data = safe_fetch_json(url, timeout=30)
+            if data and isinstance(data, list):
+                df = pd.DataFrame(data)
+                for col in ["representative", "owner"]:
+                    if col in df.columns:
+                        df = df.rename(columns={col: "name"})
+                        break
+                if "type" in df.columns:
+                    df = df.rename(columns={"type": "trade_type"})
+                df["chamber"] = "Cámara de Representantes"
+                df["source"]  = "Político"
+                return df
         except Exception as e:
-            errors.append(f"Quiver: {str(e)[:120]}")
-            data = None
+            errors.append(f"S3 House: {str(e)[:80]}")
 
-    if not data:
-        raise ConnectionError(
-            "No se pudieron cargar datos del Senado.\n"
-            "Las fuentes externas pueden estar temporalmente no disponibles.\n"
-            "Errores: " + " | ".join(errors[-2:])
-        )
-
-    df = pd.DataFrame(data)
-
-    # Normalizar nombre
-    for col in ["senator", "Politician", "owner"]:
-        if col in df.columns:
-            df = df.rename(columns={col: "name"})
-            break
-
-    # Normalizar tipo
-    for col in ["type", "Transaction"]:
-        if col in df.columns:
-            df = df.rename(columns={col: "trade_type"})
-            break
-
-    # Normalizar ticker
-    for col in ["ticker", "Ticker"]:
-        if col in df.columns and col != "ticker":
-            df = df.rename(columns={col: "ticker"})
-            break
-
-    # Normalizar monto
-    for col in ["amount", "Range"]:
-        if col in df.columns and col != "amount":
-            df = df.rename(columns={col: "amount"})
-            break
-
-    # Normalizar fecha
-    for col in ["transaction_date", "Date"]:
-        if col in df.columns and col != "transaction_date":
-            df = df.rename(columns={col: "transaction_date"})
-            break
-
-    df["chamber"] = "Senado"
-    df["source"]  = "Político"
-    return df
+    raise ConnectionError("Cámara — todas las fuentes fallaron:\n" + "\n".join(errors))
 
 
 def normalize_congressional(df: pd.DataFrame) -> pd.DataFrame:
@@ -498,34 +511,63 @@ def main():
         if "Políticos (Congreso)" not in fuentes:
             st.info("Activa **Políticos (Congreso)** en el panel de filtros para ver estos datos.")
         else:
+            # Leer clave FMP de Streamlit Secrets (opcional pero recomendado para House data)
+            try:
+                fmp_key = st.secrets.get("FMP_API_KEY", "")
+            except Exception:
+                fmp_key = ""
+
             with st.spinner("⏳ Cargando datos del Congreso (primera carga puede tardar ~20 seg)..."):
                 df_h, df_s = pd.DataFrame(), pd.DataFrame()
                 errors_cong = []
 
                 try:
-                    df_h = load_house_trades()
-                except Exception as e:
-                    errors_cong.append(f"Cámara: {str(e)[:200]}")
-
-                try:
-                    df_s = load_senate_trades()
+                    df_s = load_senate_trades(fmp_key=fmp_key)
                 except Exception as e:
                     errors_cong.append(f"Senado: {str(e)[:200]}")
 
+                try:
+                    df_h = load_house_trades(fmp_key=fmp_key)
+                except Exception as e:
+                    errors_cong.append(f"Cámara: {str(e)[:200]}")
+
                 if df_h.empty and df_s.empty:
-                    st.error(
-                        "⚠️ No se pudieron cargar los datos del Congreso en este momento.\n\n"
-                        "Esto suele ocurrir cuando los servidores externos (S3/Quiver) están "
-                        "temporalmente no disponibles. Intenta recargar la página en unos minutos.\n\n"
-                        + "\n".join(errors_cong)
-                    )
+                    st.error("⚠️ No se pudieron cargar los datos del Congreso.")
+                    st.markdown("""
+**¿Cómo solucionarlo?**
+
+Los datos del **Senado** se cargan automáticamente desde GitHub (sin configuración). Si falla, puede ser un problema temporal — intenta recargar en unos minutos.
+
+Los datos de la **Cámara de Representantes** requieren una clave API gratuita de [Financial Modeling Prep](https://financialmodelingprep.com/register):
+
+1. Regístrate gratis en **[financialmodelingprep.com/register](https://financialmodelingprep.com/register)** (sin tarjeta de crédito)
+2. Copia tu API key del dashboard
+3. En Streamlit Cloud → tu app → ⚙️ **Settings** → **Secrets**
+4. Agrega esta línea (reemplazando `TU_CLAVE_AQUI`):
+   ```
+   FMP_API_KEY = "TU_CLAVE_AQUI"
+   ```
+5. Guarda y recarga la app — ¡listo!
+
+> El plan gratuito de FMP permite **250 llamadas/día**, más que suficiente para este dashboard.
+                    """)
                     cong_ok = False
+                elif not fmp_key and df_h.empty:
+                    parts = [df for df in [df_s] if not df.empty]
+                    df_c = normalize_congressional(pd.concat(parts, ignore_index=True))
+                    cong_ok = True
+                    st.info(
+                        "ℹ️ Se cargaron datos del **Senado** correctamente. "
+                        "Para ver también la **Cámara de Representantes**, configura una clave gratuita de "
+                        "[Financial Modeling Prep](https://financialmodelingprep.com/register) "
+                        "en los Secrets de Streamlit. Ver pestaña **ℹ️ Acerca de** para instrucciones."
+                    )
                 else:
                     parts = [df for df in [df_h, df_s] if not df.empty]
                     df_c = normalize_congressional(pd.concat(parts, ignore_index=True))
                     cong_ok = True
                     if errors_cong:
-                        st.warning("⚠️ Solo se cargaron datos parciales: " + " | ".join(errors_cong))
+                        st.warning("⚠️ Datos parciales: " + " | ".join(errors_cong))
 
             if cong_ok and not df_c.empty:
                 # ── Aplicar filtros ──────────────
@@ -727,15 +769,28 @@ def main():
 **🏛️ Políticos del Congreso (STOCK Act)**
 - Todos los miembros del Congreso están obligados a declarar sus operaciones
   financieras en un plazo de **45 días** según el STOCK Act (2012).
-- Los datos son obtenidos de:
-  - [House Stock Watcher](https://housestockwatcher.com) — Cámara de Representantes
-  - [Senate Stock Watcher](https://senatestockwatcher.com) — Senado
-- Cobertura: desde 2012 hasta hoy
+- Fuentes utilizadas (en orden de prioridad):
+  - **Senado**: [Senate Stock Watcher en GitHub](https://github.com/timothycarambat/senate-stock-watcher-data) — gratis, sin configuración
+  - **Cámara + Senado**: [Financial Modeling Prep API](https://financialmodelingprep.com) — gratis con clave (ver abajo)
 
 **💼 Insiders Corporativos (Form 4)**
 - CEOs, directores y ejecutivos deben reportar sus operaciones en **2 días hábiles**.
 - Fuente oficial: [SEC EDGAR](https://www.sec.gov/cgi-bin/browse-edgar)
 - Los datos corresponden a los formularios más recientes disponibles.
+            """)
+            st.subheader("🔑 Configurar clave gratuita (para datos de la Cámara)")
+            st.markdown("""
+Para ver los trades de la **Cámara de Representantes**, necesitas una clave gratuita de Financial Modeling Prep:
+
+1. Regístrate en **[financialmodelingprep.com/register](https://financialmodelingprep.com/register)** *(gratis, sin tarjeta)*
+2. Ve a tu [dashboard](https://financialmodelingprep.com/developer/docs/dashboard) y copia tu API key
+3. En Streamlit Cloud → tu app → ⚙️ **Settings** → **Secrets** → agrega:
+```
+FMP_API_KEY = "tu_clave_aqui"
+```
+4. Guarda y recarga → aparecerán los datos de la Cámara automáticamente.
+
+> El plan gratuito permite 250 llamadas/día — más que suficiente.
             """)
 
         with col_b:
