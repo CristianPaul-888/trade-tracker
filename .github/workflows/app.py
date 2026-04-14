@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 import xml.etree.ElementTree as ET
 import re
 import time
+from bs4 import BeautifulSoup
 
 # ─────────────────────────────────────────────
 # CONFIGURACIÓN DE LA PÁGINA
@@ -297,39 +298,315 @@ def normalize_congressional(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────
-# CARGA DE DATOS DE INSIDERS (SEC EDGAR)
+# CARGA DE DATOS DE INSIDERS — DATAROMA
 # ─────────────────────────────────────────────
 
-def parse_form4_xml(xml_bytes: bytes) -> list[dict]:
+# Headers que simulan un navegador real (necesario para algunos sitios)
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer":         "https://www.dataroma.com/",
+    "Connection":      "keep-alive",
+}
+
+
+def _parse_number(text: str) -> float:
     """
-    Extrae datos de transacciones de un archivo XML de Formulario 4.
-    Retorna lista de dicts con los campos relevantes.
+    Convierte un string numérico con formato financiero a float.
+    Ejemplos: '$1,234,567' → 1234567.0 | '15.3M' → 15300000.0 | '5.4K' → 5400.0
     """
+    if not text:
+        return 0.0
+    t = str(text).strip().replace("$", "").replace(",", "").replace("%", "")
+    multiplier = 1.0
+    if t.upper().endswith("M"):
+        multiplier = 1_000_000
+        t = t[:-1]
+    elif t.upper().endswith("K"):
+        multiplier = 1_000
+        t = t[:-1]
+    elif t.upper().endswith("B"):
+        multiplier = 1_000_000_000
+        t = t[:-1]
+    try:
+        return float(t) * multiplier
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _extract_ticker_from_cell(cell) -> tuple[str, str]:
+    """
+    Extrae ticker y nombre de empresa desde una celda HTML de Dataroma.
+    Dataroma presenta las empresas en varios formatos:
+      - "Apple Inc (AAPL)"        → ('AAPL', 'Apple Inc')
+      - Enlace con href ?t=AAPL   → ('AAPL', texto)
+      - Solo texto "AAPL"         → ('AAPL', 'AAPL')
+    """
+    text = cell.get_text(strip=True)
+
+    # Formato: "Nombre de Empresa (TICKER)"
+    m = re.search(r'\(([A-Z]{1,5}(?:\.[A-Z])?)\)\s*$', text)
+    if m:
+        ticker  = m.group(1)
+        company = text[: m.start()].strip(" -–")
+        return ticker, company
+
+    # Ticker en parámetro de enlace: href="...?t=AAPL" o "...t=AAPL&..."
+    link = cell.find("a")
+    if link and link.get("href"):
+        href = link.get("href", "")
+        m2 = re.search(r'[?&]t=([A-Z]{1,5}(?:\.[A-Z])?)', href)
+        if m2:
+            return m2.group(1), text
+
+    # Si el texto es solo el ticker (todo mayúsculas, 1-5 chars)
+    if re.fullmatch(r'[A-Z]{1,5}(?:\.[A-Z])?', text):
+        return text, text
+
+    return "—", text
+
+
+def _scrape_dataroma_page(url: str) -> list[dict]:
+    """
+    Descarga y parsea UNA página de Dataroma.
+    Retorna lista de dicts con trades, o lista vacía si falla.
+    """
+    r = requests.get(url, headers=BROWSER_HEADERS, timeout=30)
+    if r.status_code != 200:
+        raise ConnectionError(f"HTTP {r.status_code} desde {url}")
+
+    soup = BeautifulSoup(r.content, "html.parser")
+
+    # ── Buscar la tabla principal ─────────────────────────────────────────
+    # Dataroma usa distintos selectores según la sección
+    table = None
+    for selector_fn in [
+        lambda s: s.find("table", {"id": "grid"}),
+        lambda s: s.find("div",   {"id": "grid"})   and s.find("div", {"id": "grid"}).find("table"),
+        lambda s: s.find("div",   {"id": "main"})   and s.find("div", {"id": "main"}).find("table"),
+        lambda s: s.find("div",   {"id": "content"})and s.find("div", {"id": "content"}).find("table"),
+        lambda s: s.find("table"),
+    ]:
+        try:
+            result = selector_fn(soup)
+            if result:
+                table = result if result.name == "table" else result.find("table")
+                if table:
+                    break
+        except Exception:
+            continue
+
+    if not table:
+        raise ValueError(f"No se encontró tabla en: {url}")
+
+    rows = table.find_all("tr")
+    if len(rows) < 2:
+        return []
+
+    # ── Detectar cabeceras ────────────────────────────────────────────────
+    header_cells = rows[0].find_all(["th", "td"])
+    col_names = [c.get_text(strip=True).lower() for c in header_cells]
+
+    # ── Mapear columnas por nombre ────────────────────────────────────────
+    def col_idx(*keywords) -> int | None:
+        for kw in keywords:
+            for i, h in enumerate(col_names):
+                if kw in h:
+                    return i
+        return None
+
+    idx_date    = col_idx("date", "fecha")
+    idx_company = col_idx("company", "stock", "empresa", "ticker")
+    idx_insider = col_idx("insider", "name", "nombre")
+    idx_title   = col_idx("title", "position", "relation", "role", "cargo")
+    idx_action  = col_idx("buy", "sell", "action", "type", "trans")
+    idx_shares  = col_idx("share", "qty", "cantidad")
+    idx_price   = col_idx("price", "avg", "precio")
+    idx_value   = col_idx("value", "total", "valor", "amount")
+
+    trades = []
+    for row in rows[1:]:
+        cells = row.find_all("td")
+        n = len(cells)
+        if n < 3:
+            continue
+
+        def get(idx, default="N/D"):
+            if idx is not None and idx < n:
+                return cells[idx].get_text(strip=True)
+            return default
+
+        # Extraer ticker y empresa
+        comp_idx = idx_company if idx_company is not None else 1
+        ticker, company = _extract_ticker_from_cell(cells[comp_idx] if comp_idx < n else cells[0])
+
+        # Tipo de operación
+        action_raw = get(idx_action, get(4, "N/D"))
+        a_low = action_raw.lower()
+        if "buy" in a_low or "purchase" in a_low or "compra" in a_low:
+            trade_type_clean = "Compra"
+        elif "sell" in a_low or "sale" in a_low or "venta" in a_low:
+            trade_type_clean = "Venta"
+        else:
+            trade_type_clean = action_raw.title()
+
+        # Valores numéricos
+        shares_raw = get(idx_shares, get(5, "0"))
+        price_raw  = get(idx_price,  get(6, "0"))
+        value_raw  = get(idx_value,  get(7, "0"))
+
+        shares = int(_parse_number(shares_raw))
+        price  = round(_parse_number(price_raw), 2)
+        total  = _parse_number(value_raw)
+        if total == 0 and shares > 0 and price > 0:
+            total = round(shares * price, 0)
+
+        trade = {
+            "transaction_date": get(idx_date, get(0, "")),
+            "company":          company,
+            "ticker":           ticker,
+            "name":             get(idx_insider, get(2, "N/D")),
+            "title":            get(idx_title,   get(3, "N/D")),
+            "trade_type":       action_raw,
+            "trade_type_clean": trade_type_clean,
+            "shares":           shares,
+            "price":            price,
+            "total_value":      total,
+            "amount":           f"${total:,.0f}" if total > 0 else "N/D",
+            "source":           "Insider (Dataroma)",
+        }
+        trades.append(trade)
+
+    return trades
+
+
+@st.cache_data(ttl=7200, show_spinner=False)
+def load_insider_trades() -> pd.DataFrame:
+    """
+    Carga datos de insiders corporativos desde Dataroma.com.
+    Fuente principal: https://www.dataroma.com/m/ins/ins.php
+    Respaldo: SEC EDGAR Form 4 feed.
+    TTL: 2 horas.
+    """
+    # ── 1. Dataroma (fuente principal) ────────────────────────────────────
+    dataroma_error = None
+    try:
+        all_trades: list[dict] = []
+
+        # Página principal de insiders de Dataroma
+        # (muestra los últimos 100–200 insiders con transacciones recientes)
+        for page_url in [
+            "https://www.dataroma.com/m/ins/ins.php",
+            "https://www.dataroma.com/m/ins/ins.php?po=1",
+            "https://www.dataroma.com/m/ins/ins.php?po=2",
+        ]:
+            try:
+                page_trades = _scrape_dataroma_page(page_url)
+                if not page_trades:
+                    break
+                all_trades.extend(page_trades)
+                time.sleep(0.5)  # Ser respetuoso con el servidor
+            except Exception:
+                break
+
+        if all_trades:
+            df = pd.DataFrame(all_trades)
+            if "transaction_date" in df.columns:
+                df["transaction_date"] = pd.to_datetime(
+                    df["transaction_date"], errors="coerce", dayfirst=False
+                )
+            df["chamber"] = df["title"].fillna("N/D")
+            return df
+
+    except Exception as e:
+        dataroma_error = str(e)
+
+    # ── 2. Respaldo: SEC EDGAR Form 4 Feed ────────────────────────────────
+    # Solo si Dataroma falla (por bloqueo, mantenimiento, etc.)
+    edgar_trades: list[dict] = []
+    try:
+        feed_url = (
+            "https://www.sec.gov/cgi-bin/browse-edgar"
+            "?action=getcurrent&type=4&dateb=&owner=include"
+            "&count=40&search_text=&output=atom"
+        )
+        r = requests.get(feed_url, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+
+        root_xml = ET.fromstring(r.content)
+        ns = {"atom": "http://www.w3.org/2005/Atom"}
+
+        for entry in root_xml.findall("atom:entry", ns)[:20]:
+            try:
+                link_el = entry.find("atom:link", ns)
+                if link_el is None:
+                    continue
+                idx_url = link_el.get("href", "")
+                idx_r = requests.get(idx_url, headers=HEADERS, timeout=10)
+                if idx_r.status_code != 200:
+                    continue
+
+                xml_paths = re.findall(r'href="(/Archives/edgar/data/[^"]+\.xml)"', idx_r.text)
+                if not xml_paths:
+                    continue
+
+                xml_r = requests.get("https://www.sec.gov" + xml_paths[0], headers=HEADERS, timeout=10)
+                if xml_r.status_code != 200:
+                    continue
+
+                edgar_trades.extend(_parse_form4_xml(xml_r.content))
+                time.sleep(0.15)
+            except Exception:
+                continue
+
+    except Exception:
+        pass
+
+    if edgar_trades:
+        df = pd.DataFrame(edgar_trades)
+        if "transaction_date" in df.columns:
+            df["transaction_date"] = pd.to_datetime(df["transaction_date"], errors="coerce")
+        if dataroma_error:
+            st.sidebar.info(f"ℹ️ Insiders: usando SEC EDGAR como respaldo (Dataroma: {dataroma_error[:60]})")
+        return df
+
+    # ── 3. Nada funcionó ─────────────────────────────────────────────────
+    raise ConnectionError(
+        "No se pudieron cargar datos de insiders.\n"
+        f"Dataroma: {dataroma_error or 'sin datos'}\n"
+        "SEC EDGAR: sin resultados"
+    )
+
+
+def _parse_form4_xml(xml_bytes: bytes) -> list[dict]:
+    """Parsea un XML de Formulario 4 de SEC EDGAR (usado como respaldo)."""
     trades = []
     try:
         root = ET.fromstring(xml_bytes)
-
-        company   = root.findtext(".//issuerName", "").strip()
-        ticker    = root.findtext(".//issuerTradingSymbol", "").strip().upper()
-        owner     = root.findtext(".//rptOwnerName", "").strip()
-        is_off    = root.findtext(".//isOfficer", "0")
-        title     = root.findtext(".//officerTitle", "").strip()
-        is_dir    = root.findtext(".//isDirector", "0")
-
-        role = title if (is_off == "1" and title) else ("Director" if is_dir == "1" else "Accionista")
+        company  = root.findtext(".//issuerName", "").strip()
+        ticker   = root.findtext(".//issuerTradingSymbol", "").strip().upper()
+        owner    = root.findtext(".//rptOwnerName", "").strip()
+        is_off   = root.findtext(".//isOfficer", "0")
+        title    = root.findtext(".//officerTitle", "").strip()
+        is_dir   = root.findtext(".//isDirector", "0")
+        role     = title if (is_off == "1" and title) else ("Director" if is_dir == "1" else "Accionista")
 
         for tx in root.findall(".//nonDerivativeTransaction"):
-            date      = tx.findtext("transactionDate/value", "").strip()
-            shares_s  = tx.findtext("transactionAmounts/transactionShares/value", "0")
-            price_s   = tx.findtext("transactionAmounts/transactionPricePerShare/value", "0")
-            action    = tx.findtext("transactionAmounts/transactionAcquiredDisposedCode/value", "").strip()
-
+            date   = tx.findtext("transactionDate/value", "").strip()
+            sh_s   = tx.findtext("transactionAmounts/transactionShares/value", "0")
+            pr_s   = tx.findtext("transactionAmounts/transactionPricePerShare/value", "0")
+            action = tx.findtext("transactionAmounts/transactionAcquiredDisposedCode/value", "").strip()
             if action not in ("A", "D"):
                 continue
-
             try:
-                shares = float(shares_s or 0)
-                price  = float(price_s or 0)
+                shares = float(sh_s or 0)
+                price  = float(pr_s or 0)
                 total  = round(shares * price, 0)
             except (ValueError, TypeError):
                 shares, price, total = 0, 0, 0
@@ -346,77 +623,12 @@ def parse_form4_xml(xml_bytes: bytes) -> list[dict]:
                 "total_value":      total,
                 "transaction_date": date,
                 "amount":           f"${total:,.0f}" if total > 0 else "N/D",
-                "source":           "Insider",
+                "source":           "Insider (SEC EDGAR)",
                 "chamber":          role,
             })
     except ET.ParseError:
         pass
     return trades
-
-
-@st.cache_data(ttl=7200, show_spinner=False)
-def load_insider_trades() -> pd.DataFrame:
-    """
-    Obtiene los 40 Form-4 más recientes vía el feed Atom de EDGAR.
-    Parsea cada XML para extraer operaciones.
-    TTL: 2 horas
-    """
-    all_trades = []
-    try:
-        feed_url = (
-            "https://www.sec.gov/cgi-bin/browse-edgar"
-            "?action=getcurrent&type=4&dateb=&owner=include"
-            "&count=40&search_text=&output=atom"
-        )
-        r = requests.get(feed_url, headers=HEADERS, timeout=30)
-        r.raise_for_status()
-
-        root = ET.fromstring(r.content)
-        ns = {"atom": "http://www.w3.org/2005/Atom"}
-        entries = root.findall("atom:entry", ns)
-
-        for entry in entries[:30]:  # Limitar para evitar timeouts
-            try:
-                link_el = entry.find("atom:link", ns)
-                if link_el is None:
-                    continue
-                idx_url = link_el.get("href", "")
-                if not idx_url:
-                    continue
-
-                # Descargar índice HTML de la presentación
-                idx_r = requests.get(idx_url, headers=HEADERS, timeout=10)
-                if idx_r.status_code != 200:
-                    continue
-
-                # Buscar enlace al XML del Form 4
-                xml_paths = re.findall(r'href="(/Archives/edgar/data/[^"]+\.xml)"', idx_r.text)
-                if not xml_paths:
-                    continue
-
-                xml_url = "https://www.sec.gov" + xml_paths[0]
-                xml_r = requests.get(xml_url, headers=HEADERS, timeout=10)
-                if xml_r.status_code != 200:
-                    continue
-
-                trades = parse_form4_xml(xml_r.content)
-                all_trades.extend(trades)
-
-                time.sleep(0.15)  # Respetar rate limits de la SEC
-
-            except Exception:
-                continue
-
-    except Exception as e:
-        st.sidebar.warning(f"⚠️ Error cargando insiders: {str(e)[:80]}")
-
-    if not all_trades:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(all_trades)
-    if "transaction_date" in df.columns:
-        df["transaction_date"] = pd.to_datetime(df["transaction_date"], errors="coerce")
-    return df
 
 
 # ─────────────────────────────────────────────
