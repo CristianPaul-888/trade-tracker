@@ -35,59 +35,218 @@ HEADERS = {
     "Accept": "application/json, text/html, */*"
 }
 
+# Headers alternativos más simples (para S3 y otras APIs)
+HEADERS_SIMPLE = {
+    "User-Agent": "python-requests/2.31.0"
+}
+
+
+def safe_fetch_json(url: str, timeout: int = 60) -> list | dict:
+    """
+    Descarga JSON de una URL con manejo robusto de errores.
+    Intenta con HEADERS normales primero, luego con headers simples.
+    Lanza Exception con mensaje útil si falla.
+    """
+    last_error = ""
+
+    for attempt, hdrs in enumerate([HEADERS, HEADERS_SIMPLE], start=1):
+        try:
+            r = requests.get(url, headers=hdrs, timeout=timeout)
+
+            # Si el servidor devuelve error HTTP, capturamos el status
+            if r.status_code != 200:
+                last_error = f"HTTP {r.status_code} desde {url}"
+                continue
+
+            # Verificar que la respuesta no esté vacía
+            text = r.text.strip()
+            if not text:
+                last_error = f"Respuesta vacía (intento {attempt})"
+                continue
+
+            # S3 a veces devuelve XML de error aunque el status sea 200
+            if text.startswith("<?xml") or text.startswith("<Error"):
+                # Extraer mensaje del XML si es posible
+                try:
+                    root = ET.fromstring(text)
+                    code = root.findtext("Code", "")
+                    msg  = root.findtext("Message", "")
+                    last_error = f"Error S3 [{code}]: {msg}"
+                except Exception:
+                    last_error = f"Respuesta XML inesperada: {text[:120]}"
+                continue
+
+            # Parsear JSON
+            return r.json()
+
+        except requests.exceptions.Timeout:
+            last_error = f"Timeout en intento {attempt}"
+        except requests.exceptions.ConnectionError as e:
+            last_error = f"Error de conexión: {str(e)[:80]}"
+        except ValueError as e:
+            # JSONDecodeError cae aquí
+            last_error = f"Formato inválido: {str(e)}"
+
+    raise ConnectionError(
+        f"No se pudo obtener datos de:\n{url}\n\nÚltimo error: {last_error}"
+    )
+
 # ─────────────────────────────────────────────
 # CARGA DE DATOS DEL CONGRESO
 # ─────────────────────────────────────────────
 
 @st.cache_data(ttl=14400, show_spinner=False)
-def load_house_trades():
+def load_house_trades() -> pd.DataFrame:
     """
     Carga trades de la Cámara de Representantes.
-    Fuente: House Stock Watcher (S3 público, datos del STOCK Act)
+    Intenta múltiples fuentes en orden hasta encontrar una que funcione.
     TTL: 4 horas
     """
-    url = "https://house-stock-watcher-data.s3-us-east-2.amazonaws.com/data/all_transactions.json"
-    r = requests.get(url, headers=HEADERS, timeout=60)
-    r.raise_for_status()
-    df = pd.DataFrame(r.json())
+    # Fuentes en orden de preferencia
+    SOURCES = [
+        "https://house-stock-watcher-data.s3-us-east-2.amazonaws.com/data/all_transactions.json",
+        "https://house-stock-watcher-data.s3.amazonaws.com/data/all_transactions.json",
+        "https://raw.githubusercontent.com/capitoltrades/capitoltrades-data/main/house_trades.json",
+    ]
 
-    # Normalizar nombre del político
-    if "representative" in df.columns:
-        df = df.rename(columns={"representative": "name"})
-    elif "owner" in df.columns:
-        df = df.rename(columns={"owner": "name"})
+    data = None
+    errors = []
+    for url in SOURCES:
+        try:
+            data = safe_fetch_json(url, timeout=60)
+            if data:
+                break
+        except Exception as e:
+            errors.append(str(e)[:120])
 
-    # Normalizar tipo de transacción
-    if "type" in df.columns:
-        df = df.rename(columns={"type": "trade_type"})
+    if not data:
+        # Intentar con Quiver Quantitative (fuente alternativa gratuita)
+        try:
+            data = safe_fetch_json("https://api.quiverquant.com/beta/live/congresstrading", timeout=30)
+            if isinstance(data, list):
+                # Quiver filtra solo Cámara baja
+                data = [d for d in data if str(d.get("House", "")).strip().lower() == "house"]
+        except Exception as e:
+            errors.append(f"Quiver: {str(e)[:120]}")
+            data = None
+
+    if not data:
+        raise ConnectionError(
+            "No se pudieron cargar datos de la Cámara de Representantes.\n"
+            "Las fuentes externas pueden estar temporalmente no disponibles.\n"
+            "Errores: " + " | ".join(errors[-2:])
+        )
+
+    df = pd.DataFrame(data)
+
+    # Normalizar nombre del político (el campo varía según la fuente)
+    for col in ["representative", "Politician", "owner"]:
+        if col in df.columns:
+            df = df.rename(columns={col: "name"})
+            break
+
+    # Normalizar tipo de operación
+    for col in ["type", "Transaction"]:
+        if col in df.columns:
+            df = df.rename(columns={col: "trade_type"})
+            break
+
+    # Normalizar ticker
+    for col in ["ticker", "Ticker"]:
+        if col in df.columns and col != "ticker":
+            df = df.rename(columns={col: "ticker"})
+            break
+
+    # Normalizar monto
+    for col in ["amount", "Range"]:
+        if col in df.columns and col != "amount":
+            df = df.rename(columns={col: "amount"})
+            break
+
+    # Normalizar fecha
+    for col in ["transaction_date", "Date"]:
+        if col in df.columns and col != "transaction_date":
+            df = df.rename(columns={col: "transaction_date"})
+            break
 
     df["chamber"] = "Cámara de Representantes"
-    df["source"] = "Político"
+    df["source"]  = "Político"
     return df
 
 
 @st.cache_data(ttl=14400, show_spinner=False)
-def load_senate_trades():
+def load_senate_trades() -> pd.DataFrame:
     """
     Carga trades del Senado.
-    Fuente: Senate Stock Watcher (S3 público, datos del STOCK Act)
+    Intenta múltiples fuentes en orden hasta encontrar una que funcione.
     TTL: 4 horas
     """
-    url = "https://senate-stock-watcher-data.s3-us-east-2.amazonaws.com/aggregate/all_transactions.json"
-    r = requests.get(url, headers=HEADERS, timeout=60)
-    r.raise_for_status()
-    df = pd.DataFrame(r.json())
+    SOURCES = [
+        "https://senate-stock-watcher-data.s3-us-east-2.amazonaws.com/aggregate/all_transactions.json",
+        "https://senate-stock-watcher-data.s3.amazonaws.com/aggregate/all_transactions.json",
+    ]
 
-    if "senator" in df.columns:
-        df = df.rename(columns={"senator": "name"})
-    elif "owner" in df.columns:
-        df = df.rename(columns={"owner": "name"})
+    data = None
+    errors = []
+    for url in SOURCES:
+        try:
+            data = safe_fetch_json(url, timeout=60)
+            if data:
+                break
+        except Exception as e:
+            errors.append(str(e)[:120])
 
-    if "type" in df.columns:
-        df = df.rename(columns={"type": "trade_type"})
+    if not data:
+        # Intentar con Quiver Quantitative
+        try:
+            data = safe_fetch_json("https://api.quiverquant.com/beta/live/congresstrading", timeout=30)
+            if isinstance(data, list):
+                data = [d for d in data if str(d.get("House", "")).strip().lower() == "senate"]
+        except Exception as e:
+            errors.append(f"Quiver: {str(e)[:120]}")
+            data = None
+
+    if not data:
+        raise ConnectionError(
+            "No se pudieron cargar datos del Senado.\n"
+            "Las fuentes externas pueden estar temporalmente no disponibles.\n"
+            "Errores: " + " | ".join(errors[-2:])
+        )
+
+    df = pd.DataFrame(data)
+
+    # Normalizar nombre
+    for col in ["senator", "Politician", "owner"]:
+        if col in df.columns:
+            df = df.rename(columns={col: "name"})
+            break
+
+    # Normalizar tipo
+    for col in ["type", "Transaction"]:
+        if col in df.columns:
+            df = df.rename(columns={col: "trade_type"})
+            break
+
+    # Normalizar ticker
+    for col in ["ticker", "Ticker"]:
+        if col in df.columns and col != "ticker":
+            df = df.rename(columns={col: "ticker"})
+            break
+
+    # Normalizar monto
+    for col in ["amount", "Range"]:
+        if col in df.columns and col != "amount":
+            df = df.rename(columns={col: "amount"})
+            break
+
+    # Normalizar fecha
+    for col in ["transaction_date", "Date"]:
+        if col in df.columns and col != "transaction_date":
+            df = df.rename(columns={col: "transaction_date"})
+            break
 
     df["chamber"] = "Senado"
-    df["source"] = "Político"
+    df["source"]  = "Político"
     return df
 
 
@@ -339,15 +498,34 @@ def main():
         if "Políticos (Congreso)" not in fuentes:
             st.info("Activa **Políticos (Congreso)** en el panel de filtros para ver estos datos.")
         else:
-            with st.spinner("⏳ Cargando datos del Congreso (primera carga puede tardar ~15 seg)..."):
+            with st.spinner("⏳ Cargando datos del Congreso (primera carga puede tardar ~20 seg)..."):
+                df_h, df_s = pd.DataFrame(), pd.DataFrame()
+                errors_cong = []
+
                 try:
                     df_h = load_house_trades()
-                    df_s = load_senate_trades()
-                    df_c = normalize_congressional(pd.concat([df_h, df_s], ignore_index=True))
-                    cong_ok = True
                 except Exception as e:
-                    st.error(f"Error al cargar datos del Congreso: {e}")
+                    errors_cong.append(f"Cámara: {str(e)[:200]}")
+
+                try:
+                    df_s = load_senate_trades()
+                except Exception as e:
+                    errors_cong.append(f"Senado: {str(e)[:200]}")
+
+                if df_h.empty and df_s.empty:
+                    st.error(
+                        "⚠️ No se pudieron cargar los datos del Congreso en este momento.\n\n"
+                        "Esto suele ocurrir cuando los servidores externos (S3/Quiver) están "
+                        "temporalmente no disponibles. Intenta recargar la página en unos minutos.\n\n"
+                        + "\n".join(errors_cong)
+                    )
                     cong_ok = False
+                else:
+                    parts = [df for df in [df_h, df_s] if not df.empty]
+                    df_c = normalize_congressional(pd.concat(parts, ignore_index=True))
+                    cong_ok = True
+                    if errors_cong:
+                        st.warning("⚠️ Solo se cargaron datos parciales: " + " | ".join(errors_cong))
 
             if cong_ok and not df_c.empty:
                 # ── Aplicar filtros ──────────────
@@ -448,7 +626,11 @@ def main():
                     df_ins = load_insider_trades()
                     ins_ok = True
                 except Exception as e:
-                    st.error(f"Error al cargar datos de insiders: {e}")
+                    st.error(
+                        f"⚠️ No se pudieron cargar datos de insiders.\n\n"
+                        f"La SEC puede estar temporalmente con alta demanda. "
+                        f"Intenta recargar en unos minutos.\n\nDetalle: {str(e)[:200]}"
+                    )
                     ins_ok = False
 
             if ins_ok and not df_ins.empty:
