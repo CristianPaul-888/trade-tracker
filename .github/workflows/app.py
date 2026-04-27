@@ -171,13 +171,47 @@ def _try_urls(urls: list, timeout: int = 45) -> tuple:
     return None, last_err
 
 
+def _parse_watcher_date(date_str: str) -> datetime | None:
+    """
+    Parsea fechas del formato Stock Watcher.
+    Formatos conocidos: MM/DD/YYYY, YYYY-MM-DD, MM/DD/YY
+    """
+    s = str(date_str).strip()
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m/%d/%y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _filter_and_sort_recent(trades: list, days_back: int = 365) -> list:
+    """
+    Filtra trades al período reciente y los ordena de más nuevo a más viejo.
+    Si ninguno entra en el período, devuelve los 1000 más recientes del total.
+    """
+    cutoff_dt = datetime.now() - timedelta(days=days_back)
+
+    def get_dt(tx):
+        return _parse_watcher_date(tx.get("transaction_date", "")) or datetime(2000, 1, 1)
+
+    # Ordenar de más reciente a más antiguo
+    trades_sorted = sorted(trades, key=get_dt, reverse=True)
+
+    # Filtrar al período solicitado
+    recent = [t for t in trades_sorted if get_dt(t) >= cutoff_dt]
+
+    # Si el filtro no encuentra nada (fechas raras), devolver los 1000 más recientes
+    return recent if recent else trades_sorted[:1000]
+
+
 def _fetch_senate_watcher() -> tuple:
     """
     Obtiene trades del Senado desde Senate Stock Watcher.
     Fuentes en orden (todas gratuitas, sin clave):
       1. senatestockwatcher.com/api  (API pública directa, datos 2026)
-      2. GitHub timothycarambat/senate-stock-watcher-data (mirror oficial, rama master)
-      3. Misma rama main como alternativa
+      2. GitHub timothycarambat/senate-stock-watcher-data rama master
+      3. Misma repo rama main
     Devuelve (trades: list, error: str). Si hay datos, error es "".
     """
     SENATE_URLS = [
@@ -192,12 +226,9 @@ def _fetch_senate_watcher() -> tuple:
 
     trades = _watcher_records_from_json(data, "Senado")
     if not trades:
-        return [], f"Senate Watcher: JSON vacío o formato inesperado (URL: {info})"
+        return [], f"Senate Watcher: JSON vacío o formato inesperado (fuente: {info})"
 
-    # Filtrar al último año si hay muchos datos históricos
-    cutoff = str(datetime.now().year - 1)
-    recent = [t for t in trades if str(t.get("transaction_date", "")) >= cutoff]
-    return (recent if recent else trades[-500:]), ""
+    return _filter_and_sort_recent(trades, days_back=365), ""
 
 
 def _fetch_house_watcher() -> tuple:
@@ -205,7 +236,7 @@ def _fetch_house_watcher() -> tuple:
     Obtiene trades de la Cámara desde House Stock Watcher.
     Fuentes en orden (todas gratuitas, sin clave):
       1. housestockwatcher.com/api  (API pública directa, datos 2026)
-      2. GitHub timothycarambat/house-stock-watcher-data (si existe)
+      2. GitHub timothycarambat/house-stock-watcher-data rama master/main
     Devuelve (trades: list, error: str). Si hay datos, error es "".
     """
     HOUSE_URLS = [
@@ -220,11 +251,9 @@ def _fetch_house_watcher() -> tuple:
 
     trades = _watcher_records_from_json(data, "Cámara de Representantes")
     if not trades:
-        return [], f"House Watcher: JSON vacío o formato inesperado (URL: {info})"
+        return [], f"House Watcher: JSON vacío o formato inesperado (fuente: {info})"
 
-    cutoff = str(datetime.now().year - 1)
-    recent = [t for t in trades if str(t.get("transaction_date", "")) >= cutoff]
-    return (recent if recent else trades[-500:]), ""
+    return _filter_and_sort_recent(trades, days_back=365), ""
 
 
 @st.cache_data(ttl=7200, show_spinner=False)
@@ -762,7 +791,7 @@ def main():
             "Período de tiempo",
             ["Últimos 7 días", "Últimos 30 días", "Últimos 90 días",
              "Último año", "Todo el historial"],
-            index=3,  # Default: Último año (evita perder datos por fechas mal parseadas)
+            index=4,  # Default: Todo el historial (los datos ya vienen filtrados al último año)
         )
 
         tipo_op = st.multiselect(
