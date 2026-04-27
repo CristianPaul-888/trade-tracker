@@ -101,8 +101,10 @@ def safe_fetch_json(url: str, timeout: int = 60, extra_headers: dict | None = No
 def _normalize_quiver_congress(data: list) -> pd.DataFrame:
     """
     Normaliza el formato JSON de Quiver Quantitative al esquema común.
-    Quiver devuelve: Politician, Ticker, Transaction, Date, Amount, Party, State, Chamber, Description
+    Quiver devuelve: Politician, Ticker, Transaction, Date, Filed, Amount, Party, State, Chamber, Description
     Ventaja: incluye AMBAS cámaras + partido político en una sola llamada.
+      - Date  → transaction_date  (fecha en que se realizó la operación)
+      - Filed → disclosure_date   (fecha en que el político entregó la declaración)
     """
     df = pd.DataFrame(data)
  
@@ -111,6 +113,7 @@ def _normalize_quiver_congress(data: list) -> pd.DataFrame:
         "Ticker":       "ticker",
         "Transaction":  "trade_type",
         "Date":         "transaction_date",
+        "Filed":        "disclosure_date",   # fecha de entrega / divulgación
         "Amount":       "amount",
         "Party":        "party",
         "State":        "state",
@@ -898,7 +901,8 @@ def main():
                 st.subheader(f"📋 Transacciones ({len(df_f):,} resultados)")
  
                 COLS_CONG = {
-                    "transaction_date": "Fecha",
+                    "transaction_date": "Fecha transacción",
+                    "disclosure_date":  "Fecha declaración",
                     "name":             "Político",
                     "chamber":          "Cámara",
                     "party":            "Partido",
@@ -911,8 +915,12 @@ def main():
                 show = [c for c in COLS_CONG if c in df_f.columns]
                 df_show = df_f[show].rename(columns=COLS_CONG).copy()
  
-                if "Fecha" in df_show.columns:
-                    df_show["Fecha"] = pd.to_datetime(df_show["Fecha"]).dt.strftime("%d/%m/%Y")
+                # Formatear ambas fechas a DD/MM/YYYY
+                for col_fecha in ["Fecha transacción", "Fecha declaración"]:
+                    if col_fecha in df_show.columns:
+                        df_show[col_fecha] = pd.to_datetime(
+                            df_show[col_fecha], errors="coerce"
+                        ).dt.strftime("%d/%m/%Y").fillna("—")
  
                 st.dataframe(df_show, use_container_width=True, height=420, hide_index=True)
  
