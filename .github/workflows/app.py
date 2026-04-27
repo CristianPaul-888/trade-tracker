@@ -101,43 +101,60 @@ def safe_fetch_json(url: str, timeout: int = 60, extra_headers: dict | None = No
 def _normalize_quiver_congress(data: list) -> pd.DataFrame:
     """
     Normaliza el formato JSON de Quiver Quantitative al esquema común.
-    Quiver devuelve: Politician, Ticker, Transaction, Date, Filed, Amount, Party, State, Chamber, Description
-    Ventaja: incluye AMBAS cámaras + partido político en una sola llamada.
-      - Date  → transaction_date  (fecha en que se realizó la operación)
-      - Filed → disclosure_date   (fecha en que el político entregó la declaración)
+    Columnas reales que devuelve la API:
+      Representative, BioGuideID, ReportDate, TransactionDate, ticker,
+      trade_type, Range, House, amount, party, last_modified, TickerType,
+      asset_description, ExcessReturn, PriceChange, SPYChange, chamber, source
     """
     df = pd.DataFrame(data)
  
     rename_map = {
-        "Politician":   "name",
-        "Ticker":       "ticker",
-        "Transaction":  "trade_type",
-        "Date":         "transaction_date",
-        "Filed":        "disclosure_date",   # fecha de entrega / divulgación
-        "Amount":       "amount",
-        "Party":        "party",
-        "State":        "state",
-        "Description":  "asset_description",
+        # Nombre del político
+        "Representative":  "name",
+        "Politician":      "name",        # nombre alternativo por si cambia
+        # Fechas
+        "TransactionDate": "transaction_date",   # fecha en que se realizó la operación
+        "ReportDate":      "disclosure_date",    # fecha en que entregó la declaración
+        "Date":            "transaction_date",   # nombre alternativo
+        "Filed":           "disclosure_date",    # nombre alternativo
+        # Monto / rango
+        "Range":           "amount",
+        "Amount":          "amount",
+        # Tipo de activo
+        "TickerType":      "asset_type",
     }
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
  
-    # Mapear cámara a español
-    if "Chamber" in df.columns:
-        df["chamber"] = df["Chamber"].map({
-            "House":   "Cámara de Representantes",
-            "Senate":  "Senado",
-        }).fillna(df["Chamber"])
-        df = df.drop(columns=["Chamber"])
+    # Mapear cámara a español — puede venir como "Chamber" (mayúscula) o "chamber" (minúscula)
+    for col in ["Chamber", "chamber"]:
+        if col in df.columns:
+            df["chamber"] = df[col].map({
+                "House":   "Cámara de Representantes",
+                "Senate":  "Senado",
+                "house":   "Cámara de Representantes",
+                "senate":  "Senado",
+            }).fillna(df[col])
+            if col == "Chamber":
+                df = df.drop(columns=["Chamber"])
+            break
     else:
         df["chamber"] = "Congreso"
  
     # Mapear partido a nombre completo
     if "party" in df.columns:
         df["party"] = df["party"].map({
-            "D": "Demócrata",
-            "R": "Republicano",
-            "I": "Independiente",
+            "D":          "Demócrata",
+            "R":          "Republicano",
+            "I":          "Independiente",
+            "Democrat":   "Demócrata",
+            "Republican": "Republicano",
         }).fillna(df["party"])
+ 
+    # Eliminar columnas internas que no aportan al usuario
+    drop_cols = [c for c in ["BioGuideID", "House", "last_modified",
+                              "ExcessReturn", "PriceChange", "SPYChange"] if c in df.columns]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
  
     df["source"] = "Político"
     return df
@@ -788,8 +805,11 @@ def main():
  
                     # Banner informativo según fuente activa
                     if quiver_key:
-                        n_senate  = (df_c.get("chamber", pd.Series()) == "Senado").sum()
-                        n_house   = (df_c.get("chamber", pd.Series()) == "Cámara de Representantes").sum()
+                        if "chamber" in df_c.columns:
+                            n_senate = df_c["chamber"].str.contains("enado", na=False).sum()
+                            n_house  = df_c["chamber"].str.contains("mara|House|house", na=False).sum()
+                        else:
+                            n_senate = n_house = 0
                         st.success(
                             f"✅ Datos de **Quiver Quantitative** — "
                             f"Senado: {n_senate:,} | Cámara: {n_house:,} transacciones"
