@@ -805,6 +805,13 @@ def main():
             if cong_ok and not df_c.empty:
                 total_loaded = len(df_c)
  
+                # ── Diagnóstico: mostrar columnas reales si falta transaction_date ──
+                if "transaction_date" not in df_c.columns:
+                    st.warning(
+                        f"⚠️ La fuente de datos no incluye la columna 'transaction_date'. "
+                        f"Columnas disponibles: `{', '.join(df_c.columns.tolist())}`"
+                    )
+ 
                 # ── Diagnóstico de fechas (ayuda a detectar problemas de parsing) ──
                 if "transaction_date" in df_c.columns:
                     n_nat = df_c["transaction_date"].isna().sum()
@@ -830,7 +837,8 @@ def main():
                 if nombre_input and "name" in df_c.columns:
                     mask &= df_c["name"].str.lower().str.contains(nombre_input, na=False)
  
-                df_f = df_c[mask].sort_values("transaction_date", ascending=False, na_position="last")
+                sort_col = "transaction_date" if "transaction_date" in df_c.columns else None
+                df_f = df_c[mask].sort_values(sort_col, ascending=False, na_position="last") if sort_col else df_c[mask]
  
                 # Si el filtro de fecha dejó 0 resultados pero había datos, avisar al usuario
                 if len(df_f) == 0 and total_loaded > 0:
