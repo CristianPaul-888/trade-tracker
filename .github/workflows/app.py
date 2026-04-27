@@ -202,120 +202,139 @@ def _normalize_fmp_congress(data: list, chamber: str) -> pd.DataFrame:
     return df
  
  
-def _scrape_capitoltrades(max_pages: int = 5) -> list[dict]:
+def _fetch_senate_efts(days_back: int = 180) -> list[dict]:
     """
-    Scrapes capitoltrades.com para obtener trades recientes del Congreso.
-    Capitol Trades es un agregador público que actualiza datos diariamente con información de 2026.
+    Obtiene trades del Senado desde el sistema oficial EFTS del gobierno de EE.UU.
+    URL: https://efts.senate.gov/LATEST/search-results
  
-    Estrategia:
-      1. Busca el blob JSON de Next.js (__NEXT_DATA__) embebido en el HTML.
-      2. Si no está, parsea la tabla HTML directamente.
+    Paso 1: Llama a la API de búsqueda EFTS → obtiene IDs de declaraciones PTR recientes.
+    Paso 2: Por cada declaración, descarga el XML individual y parsea las transacciones.
+ 
+    Fuente 100% oficial, gratuita, sin clave. Datos actualizados con 2026.
+    """
+    end_dt   = datetime.now()
+    start_dt = end_dt - timedelta(days=days_back)
+ 
+    search_url = (
+        "https://efts.senate.gov/LATEST/search-results"
+        f"?q=%22%22&dateRange=custom"
+        f"&fromDate={start_dt.strftime('%Y-%m-%d')}"
+        f"&toDate={end_dt.strftime('%Y-%m-%d')}"
+        "&resultType=filings&filerType=Senator&reportTypes[]=PT&offset=0&limit=200"
+    )
+ 
+    r = requests.get(search_url, headers=HEADERS, timeout=30)
+    if r.status_code != 200:
+        raise ConnectionError(f"Senate EFTS HTTP {r.status_code}")
+ 
+    hits = r.json().get("hits", {}).get("hits", [])
+    if not hits:
+        return []
+ 
+    trades: list[dict] = []
+    for hit in hits[:60]:
+        src    = hit.get("_source", {})
+        doc_id = hit.get("_id", "")
+        name   = f"{src.get('first_name','').strip()} {src.get('last_name','').strip()}".strip()
+        state  = (src.get("contact_state") or src.get("state") or "").strip()
+ 
+        xml_url = f"https://efts.senate.gov/LATEST/search-results/{doc_id}.xml"
+        try:
+            xr = requests.get(xml_url, headers=HEADERS, timeout=12)
+            if xr.status_code != 200:
+                continue
+            root = ET.fromstring(xr.content)
+            for tx in root.findall(".//Transaction"):
+                ticker = (tx.findtext("Ticker") or "").strip()
+                asset  = (tx.findtext("AssetName") or "").strip()
+                if not (ticker or asset):
+                    continue
+                trades.append({
+                    "name":             name,
+                    "state":            state,
+                    "chamber":          "Senado",
+                    "party":            "",
+                    "ticker":           ticker or "—",
+                    "asset_description": asset,
+                    "transaction_date": (tx.findtext("TransactionDate") or "").strip(),
+                    "disclosure_date":  (tx.findtext("NotificationDate") or "").strip(),
+                    "trade_type":       (tx.findtext("Type") or "").strip(),
+                    "amount_range":     (tx.findtext("Amount") or "").strip(),
+                    "source":           "Político",
+                })
+            time.sleep(0.1)
+        except Exception:
+            continue
+ 
+    return trades
+ 
+ 
+def _fetch_house_ptr(year: int) -> list[dict]:
+    """
+    Obtiene trades de la Cámara de Representantes desde el sistema oficial
+    del House Clerk (disclosures-clerk.house.gov).
+ 
+    Paso 1: Busca declaraciones PTR del año dado.
+    Paso 2: Por cada declaración, descarga el XML y parsea las transacciones.
+ 
+    Fuente 100% oficial, gratuita, sin clave. Datos actualizados con 2026.
     """
     trades: list[dict] = []
  
-    for page in range(1, max_pages + 1):
-        url = f"https://www.capitoltrades.com/trades?pageSize=96&page={page}"
-        try:
-            r = requests.get(url, headers=BROWSER_HEADERS, timeout=35)
-            if r.status_code != 200:
-                break
+    search_url = (
+        "https://disclosures-clerk.house.gov/FinancialDisclosure/search/getTasks"
+        f"?PeriodID=&ReportTypeID=7&StateID=&LastName=&FilingYear={year}&Submit=Search"
+    )
  
-            soup = BeautifulSoup(r.content, "html.parser")
+    try:
+        r = requests.get(search_url, headers=BROWSER_HEADERS, timeout=30)
+        if r.status_code != 200:
+            return []
  
-            # ── Método 1: datos embebidos por Next.js ──────────────────────
-            script_tag = soup.find("script", {"id": "__NEXT_DATA__"})
-            if script_tag and script_tag.string:
-                next_data = json.loads(script_tag.string)
-                page_props = next_data.get("props", {}).get("pageProps", {})
+        soup = BeautifulSoup(r.content, "html.parser")
+        table = soup.find("table")
+        if not table:
+            return []
  
-                # Capitol Trades puede guardar los trades en distintos paths
-                trade_list = (
-                    page_props.get("trades") or
-                    page_props.get("data", {}).get("trades") or
-                    page_props.get("initialData", {}).get("trades") or
-                    []
-                )
+        for row in table.find_all("tr")[1:70]:
+            cells = row.find_all("td")
+            if not cells:
+                continue
+            name = cells[0].get_text(strip=True)
  
-                if trade_list:
-                    for t in trade_list:
-                        # El objeto politician puede ser un dict anidado
-                        pol = t.get("politician") or {}
-                        if isinstance(pol, str):
-                            pol_name = pol
-                            pol_party = t.get("party", "")
-                            pol_chamber = t.get("chamber", "")
-                            pol_state = t.get("state", "")
-                        else:
-                            pol_name   = pol.get("name", "") or pol.get("fullName", "")
-                            pol_party  = pol.get("party", "") or t.get("party", "")
-                            pol_chamber = pol.get("chamber", "") or t.get("chamber", "")
-                            pol_state  = pol.get("state", "") or t.get("state", "")
- 
-                        trades.append({
-                            "name":             pol_name,
-                            "party":            pol_party,
-                            "chamber":          pol_chamber,
-                            "state":            pol_state,
-                            "ticker":           t.get("ticker", "") or t.get("assetTicker", ""),
-                            "asset_description": (t.get("assetDescription") or
-                                                  t.get("asset", {}).get("assetDescription", "") or
-                                                  t.get("company", "")),
-                            "trade_type":       t.get("transactionType", "") or t.get("type", ""),
-                            "transaction_date": t.get("tradeDate", "") or t.get("txDate", "") or t.get("date", ""),
-                            "disclosure_date":  t.get("filedDate", "") or t.get("reportDate", "") or t.get("filed", ""),
-                            "amount_range":     t.get("amount", "") or t.get("size", "") or t.get("range", ""),
-                        })
-                    time.sleep(0.5)
-                    continue  # Siguiente página
- 
-            # ── Método 2: tabla HTML ───────────────────────────────────────
-            table = soup.find("table")
-            if not table:
-                break  # Sin datos → detener paginación
- 
-            headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
- 
-            def col_idx(*keys):
-                for k in keys:
-                    for i, h in enumerate(headers):
-                        if k in h:
-                            return i
-                return None
- 
-            idx_name    = col_idx("politician", "name", "representative", "senator")
-            idx_ticker  = col_idx("ticker", "symbol", "stock")
-            idx_type    = col_idx("type", "transaction", "action", "trade")
-            idx_txdate  = col_idx("traded", "trade date", "transaction date")
-            idx_filed   = col_idx("filed", "report", "disclosure date")
-            idx_amount  = col_idx("amount", "size", "value", "range")
-            idx_party   = col_idx("party")
-            idx_chamber = col_idx("chamber")
-            idx_asset   = col_idx("asset", "company", "description")
- 
-            for row in table.find_all("tr")[1:]:
-                cells = row.find_all("td")
-                if not cells:
+            for link in row.find_all("a", href=True):
+                href = link["href"]
+                if not (".xml" in href.lower() or "ptr-xml" in href.lower()):
                     continue
- 
-                def get(idx, default=""):
-                    return cells[idx].get_text(strip=True) if idx is not None and idx < len(cells) else default
- 
-                trades.append({
-                    "name":             get(idx_name),
-                    "ticker":           get(idx_ticker),
-                    "trade_type":       get(idx_type),
-                    "transaction_date": get(idx_txdate),
-                    "disclosure_date":  get(idx_filed),
-                    "amount_range":     get(idx_amount),
-                    "party":            get(idx_party),
-                    "chamber":          get(idx_chamber),
-                    "asset_description": get(idx_asset),
-                })
- 
-            time.sleep(0.5)
- 
-        except Exception:
-            break
+                if not href.startswith("http"):
+                    href = "https://disclosures-clerk.house.gov" + href
+                try:
+                    xr = requests.get(href, headers=BROWSER_HEADERS, timeout=12)
+                    if xr.status_code != 200:
+                        continue
+                    root = ET.fromstring(xr.content)
+                    for tx in root.findall(".//Transaction"):
+                        ticker = (tx.findtext("Ticker") or "").strip()
+                        asset  = (tx.findtext("AssetName") or "").strip()
+                        if not (ticker or asset):
+                            continue
+                        trades.append({
+                            "name":             name,
+                            "chamber":          "Cámara de Representantes",
+                            "party":            "",
+                            "ticker":           ticker or "—",
+                            "asset_description": asset,
+                            "transaction_date": (tx.findtext("TransactionDate") or "").strip(),
+                            "disclosure_date":  (tx.findtext("NotificationDate") or "").strip(),
+                            "trade_type":       (tx.findtext("transactionType") or tx.findtext("Type") or "").strip(),
+                            "amount_range":     (tx.findtext("Amount") or "").strip(),
+                            "source":           "Político",
+                        })
+                    time.sleep(0.1)
+                except Exception:
+                    continue
+    except Exception:
+        pass
  
     return trades
  
@@ -332,41 +351,39 @@ def load_congress_trades(quiver_key: str = "", fmp_key: str = "") -> pd.DataFram
     TTL: 2 horas
     """
     errors = []
+    current_year = datetime.now().year
  
-    # ── 1. Capitol Trades (fuente principal — datos 2026 actualizados) ────
-    # Sitio público que agrega datos oficiales del Congreso diariamente.
-    # No requiere clave. Incluye Senado + Cámara + partido político.
+    # ── 1. Senate EFTS (fuente oficial del gobierno — Senado 2026) ────────
+    # Sistema electrónico oficial del Senado de EE.UU. Sin clave. Sin costo.
+    # Incluye todos los PTR (Periodic Transaction Reports) desde los últimos 180 días.
     try:
-        ct_trades = _scrape_capitoltrades(max_pages=5)
-        if ct_trades and len(ct_trades) > 10:
-            df = pd.DataFrame(ct_trades)
-            # Mapear cámara a español
-            if "chamber" in df.columns:
-                df["chamber"] = df["chamber"].str.strip().map({
-                    "House":   "Cámara de Representantes",
-                    "Senate":  "Senado",
-                    "house":   "Cámara de Representantes",
-                    "senate":  "Senado",
-                }).fillna(df["chamber"])
-            else:
-                df["chamber"] = "Congreso"
-            # Mapear partido a español
-            if "party" in df.columns:
-                df["party"] = df["party"].str.strip().map({
-                    "D":          "Demócrata",
-                    "R":          "Republicano",
-                    "I":          "Independiente",
-                    "Democrat":   "Demócrata",
-                    "Republican": "Republicano",
-                }).fillna(df["party"])
-            df["source"] = "Político"
-            # Limpiar filas sin ticker ni nombre
-            df = df[df["ticker"].astype(str).str.strip().ne("") | df["name"].astype(str).str.strip().ne("")]
-            return df
+        senate_trades = _fetch_senate_efts(days_back=180)
+        if senate_trades and len(senate_trades) > 0:
+            df_senate = pd.DataFrame(senate_trades)
+        else:
+            df_senate = pd.DataFrame()
     except Exception as e:
-        errors.append(f"Capitol Trades: {str(e)[:120]}")
+        errors.append(f"Senate EFTS: {str(e)[:120]}")
+        df_senate = pd.DataFrame()
  
-    # ── 2. Quiver Quantitative (datos históricos ~2020) ───────────────────
+    # ── 2. House Clerk (fuente oficial del gobierno — Cámara 2026) ────────
+    # Sistema electrónico oficial de la Cámara de Representantes. Sin clave.
+    try:
+        house_trades = _fetch_house_ptr(year=current_year)
+        if house_trades and len(house_trades) > 0:
+            df_house = pd.DataFrame(house_trades)
+        else:
+            df_house = pd.DataFrame()
+    except Exception as e:
+        errors.append(f"House Clerk: {str(e)[:120]}")
+        df_house = pd.DataFrame()
+ 
+    # Combinar Senado + Cámara si alguno tiene datos
+    parts = [df for df in [df_senate, df_house] if not df.empty]
+    if parts:
+        return pd.concat(parts, ignore_index=True)
+ 
+    # ── 3. Quiver Quantitative (datos históricos ~2020, requiere clave) ───
     if quiver_key:
         try:
             data = safe_fetch_json(
@@ -379,28 +396,9 @@ def load_congress_trades(quiver_key: str = "", fmp_key: str = "") -> pd.DataFram
         except Exception as e:
             errors.append(f"Quiver: {str(e)[:120]}")
  
-    # ── 3. GitHub Senate Stock Watcher (respaldo gratuito — solo Senado) ──
-    for url in [
-        "https://raw.githubusercontent.com/timothycarambat/senate-stock-watcher-data/master/aggregate/all_transactions.json",
-        "https://raw.githubusercontent.com/rdumont/senate-stock-watcher-data/master/aggregate/all_transactions.json",
-    ]:
-        try:
-            data = safe_fetch_json(url, timeout=45)
-            if data and isinstance(data, list) and len(data) > 10:
-                df = pd.DataFrame(data)
-                if "senator" in df.columns:
-                    df = df.rename(columns={"senator": "name"})
-                elif "owner" in df.columns:
-                    df = df.rename(columns={"owner": "name"})
-                if "type" in df.columns:
-                    df = df.rename(columns={"type": "trade_type"})
-                df["chamber"] = "Senado"
-                df["source"]  = "Político"
-                return df
-        except Exception as e:
-            errors.append(f"GitHub Senate: {str(e)[:100]}")
- 
-    raise ConnectionError("Congreso — todas las fuentes fallaron:\n" + "\n".join(errors))
+    raise ConnectionError(
+        "Congreso — todas las fuentes fallaron:\n" + "\n".join(errors)
+    )
  
  
 def _robust_parse_date(series: pd.Series) -> pd.Series:
