@@ -4,10 +4,10 @@ US Trade Tracker - Dashboard Principal
 Plataforma de monitoreo de transacciones financieras de:
   - Políticos del Congreso de EE.UU. (STOCK Act)
   - Insiders corporativos (SEC EDGAR Form 4)
-
+ 
 Fuentes de datos: 100% gratuitas y públicas.
 """
-
+ 
 import streamlit as st
 import pandas as pd
 import requests
@@ -17,31 +17,31 @@ import xml.etree.ElementTree as ET
 import re
 import time
 from bs4 import BeautifulSoup
-
+ 
 # ─────────────────────────────────────────────
 # CONFIGURACIÓN DE LA PÁGINA
 # ─────────────────────────────────────────────
-
+ 
 st.set_page_config(
     page_title="📊 US Trade Tracker",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
+ 
 # Cabecera de identificación para las APIs (requerido por SEC)
 HEADERS = {
     "User-Agent": "USTradeTracker/1.0 (github.com/usuario/trade-tracker; info@ejemplo.com)",
     "Accept-Encoding": "gzip, deflate",
     "Accept": "application/json, text/html, */*"
 }
-
+ 
 # Headers alternativos más simples (para S3 y otras APIs)
 HEADERS_SIMPLE = {
     "User-Agent": "python-requests/2.31.0"
 }
-
-
+ 
+ 
 def safe_fetch_json(url: str, timeout: int = 60, extra_headers: dict | None = None) -> list | dict:
     """
     Descarga JSON de una URL con manejo robusto de errores.
@@ -50,12 +50,12 @@ def safe_fetch_json(url: str, timeout: int = 60, extra_headers: dict | None = No
     """
     last_error = ""
     base_headers_list = [HEADERS, HEADERS_SIMPLE]
-
+ 
     for attempt, base_hdrs in enumerate(base_headers_list, start=1):
         hdrs = {**base_hdrs, **(extra_headers or {})}
         try:
             r = requests.get(url, headers=hdrs, timeout=timeout)
-
+ 
             if r.status_code == 401:
                 raise ConnectionError(f"Clave API inválida o falta autorización (HTTP 401) — {url}")
             if r.status_code == 403:
@@ -64,12 +64,12 @@ def safe_fetch_json(url: str, timeout: int = 60, extra_headers: dict | None = No
             if r.status_code != 200:
                 last_error = f"HTTP {r.status_code} — {url}"
                 continue
-
+ 
             text = r.text.strip()
             if not text:
                 last_error = f"Respuesta vacía del servidor (intento {attempt})"
                 continue
-
+ 
             # S3 y algunos proxies devuelven XML de error con status 200
             if text.startswith("<?xml") or text.startswith("<Error") or text.startswith("<html"):
                 try:
@@ -80,9 +80,9 @@ def safe_fetch_json(url: str, timeout: int = 60, extra_headers: dict | None = No
                 except Exception:
                     last_error = f"Respuesta no-JSON: {text[:100]}"
                 continue
-
+ 
             return r.json()
-
+ 
         except ConnectionError:
             raise  # Re-lanzar errores 401 inmediatamente
         except requests.exceptions.Timeout:
@@ -91,80 +91,130 @@ def safe_fetch_json(url: str, timeout: int = 60, extra_headers: dict | None = No
             last_error = f"Error de conexión: {str(e)[:80]}"
         except ValueError as e:
             last_error = f"JSON inválido: {str(e)[:80]}"
-
+ 
     raise ConnectionError(f"No se pudo obtener datos de {url} — {last_error}")
-
+ 
 # ─────────────────────────────────────────────
 # CARGA DE DATOS DEL CONGRESO
 # ─────────────────────────────────────────────
-
+ 
+def _normalize_quiver_congress(data: list) -> pd.DataFrame:
+    """
+    Normaliza el formato JSON de Quiver Quantitative al esquema común.
+    Quiver devuelve: Politician, Ticker, Transaction, Date, Amount, Party, State, Chamber, Description
+    Ventaja: incluye AMBAS cámaras + partido político en una sola llamada.
+    """
+    df = pd.DataFrame(data)
+ 
+    rename_map = {
+        "Politician":   "name",
+        "Ticker":       "ticker",
+        "Transaction":  "trade_type",
+        "Date":         "transaction_date",
+        "Amount":       "amount",
+        "Party":        "party",
+        "State":        "state",
+        "Description":  "asset_description",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+ 
+    # Mapear cámara a español
+    if "Chamber" in df.columns:
+        df["chamber"] = df["Chamber"].map({
+            "House":   "Cámara de Representantes",
+            "Senate":  "Senado",
+        }).fillna(df["Chamber"])
+        df = df.drop(columns=["Chamber"])
+    else:
+        df["chamber"] = "Congreso"
+ 
+    # Mapear partido a nombre completo
+    if "party" in df.columns:
+        df["party"] = df["party"].map({
+            "D": "Demócrata",
+            "R": "Republicano",
+            "I": "Independiente",
+        }).fillna(df["party"])
+ 
+    df["source"] = "Político"
+    return df
+ 
+ 
 def _normalize_fmp_congress(data: list, chamber: str) -> pd.DataFrame:
     """
     Normaliza el formato JSON de Financial Modeling Prep (FMP) al esquema común.
     FMP devuelve: firstName, lastName, symbol, type, amount, transactionDate, dateRecieved, assetDescription
     """
     df = pd.DataFrame(data)
-
-    # Construir nombre completo
+ 
     if "firstName" in df.columns and "lastName" in df.columns:
         df["name"] = (df["firstName"].fillna("") + " " + df["lastName"].fillna("")).str.strip()
     elif "Politician" in df.columns:
         df = df.rename(columns={"Politician": "name"})
-
-    # Ticker
+ 
     if "symbol" in df.columns:
         df = df.rename(columns={"symbol": "ticker"})
     elif "Ticker" in df.columns:
         df = df.rename(columns={"Ticker": "ticker"})
-
-    # Tipo de operación
+ 
     if "type" in df.columns:
         df = df.rename(columns={"type": "trade_type"})
     elif "Transaction" in df.columns:
         df = df.rename(columns={"Transaction": "trade_type"})
-
-    # Fechas
+ 
     if "transactionDate" in df.columns:
         df = df.rename(columns={"transactionDate": "transaction_date"})
     elif "Date" in df.columns:
         df = df.rename(columns={"Date": "transaction_date"})
-
+ 
     if "dateRecieved" in df.columns:
         df = df.rename(columns={"dateRecieved": "disclosure_date"})
-
-    # Descripción del activo
+ 
     if "assetDescription" in df.columns:
         df = df.rename(columns={"assetDescription": "asset_description"})
-
-    # Estado / partido si existen
+ 
     if "stateDist" in df.columns and "state" not in df.columns:
         df = df.rename(columns={"stateDist": "state"})
-
+ 
     df["chamber"] = chamber
     df["source"]  = "Político"
     return df
-
-
-@st.cache_data(ttl=14400, show_spinner=False)
-def load_senate_trades(fmp_key: str = "") -> pd.DataFrame:
+ 
+ 
+@st.cache_data(ttl=7200, show_spinner=False)
+def load_congress_trades(quiver_key: str = "", fmp_key: str = "") -> pd.DataFrame:
     """
-    Carga trades del Senado.
-
+    Carga trades del Congreso (Senado + Cámara de Representantes).
+ 
     Orden de fuentes:
-      1. GitHub Senate Stock Watcher (timothycarambat) — gratis, sin clave
-      2. Financial Modeling Prep (FMP) — 250 llamadas/día gratis, requiere clave
-      3. S3 House Stock Watcher (legado, puede estar caído)
-    TTL: 4 horas
+      1. Quiver Quantitative API — ambas cámaras + partido, requiere clave gratuita
+      2. GitHub Senate Stock Watcher (timothycarambat) — solo Senado, gratis sin clave
+      3. Financial Modeling Prep (FMP) — requiere clave gratuita
+    TTL: 2 horas
     """
     errors = []
-
-    # ── 1. GitHub Senate Stock Watcher ────────────────────────────────────
-    # Mantenido por la comunidad. Actualizado continuamente con datos del STOCK Act.
-    GITHUB_URLS = [
+ 
+    # ── 1. Quiver Quantitative (fuente principal) ─────────────────────────
+    # Endpoint gratuito con registro en quiverquant.com
+    # Devuelve AMBAS cámaras + partido político en una sola llamada.
+    if quiver_key:
+        try:
+            data = safe_fetch_json(
+                "https://api.quiverquant.com/beta/live/congresstrading",
+                timeout=45,
+                extra_headers={"Authorization": f"Token {quiver_key}"}
+            )
+            if data and isinstance(data, list) and len(data) > 0:
+                return _normalize_quiver_congress(data)
+        except Exception as e:
+            errors.append(f"Quiver: {str(e)[:120]}")
+ 
+    # ── 2. GitHub Senate Stock Watcher (respaldo gratuito) ───────────────
+    # Solo Senado. Mantenido por la comunidad. Sin clave requerida.
+    for url in [
         "https://raw.githubusercontent.com/timothycarambat/senate-stock-watcher-data/master/aggregate/all_transactions.json",
         "https://raw.githubusercontent.com/rdumont/senate-stock-watcher-data/master/aggregate/all_transactions.json",
-    ]
-    for url in GITHUB_URLS:
+    ]:
         try:
             data = safe_fetch_json(url, timeout=45)
             if data and isinstance(data, list) and len(data) > 10:
@@ -180,90 +230,26 @@ def load_senate_trades(fmp_key: str = "") -> pd.DataFrame:
                 return df
         except Exception as e:
             errors.append(f"GitHub Senate: {str(e)[:100]}")
-
-    # ── 2. Financial Modeling Prep API ────────────────────────────────────
-    # Requiere FMP_API_KEY en Streamlit Secrets (gratis en fmp.financialmodelingprep.com)
+ 
+    # ── 3. Financial Modeling Prep (respaldo con clave) ───────────────────
     if fmp_key:
-        try:
-            data = safe_fetch_json(
-                f"https://financialmodelingprep.com/api/v4/senate-trading?apikey={fmp_key}",
-                timeout=30
-            )
-            if data and isinstance(data, list) and len(data) > 0:
-                return _normalize_fmp_congress(data, "Senado")
-        except Exception as e:
-            errors.append(f"FMP Senate: {str(e)[:100]}")
-
-    # ── 3. S3 legado ──────────────────────────────────────────────────────
-    for url in [
-        "https://senate-stock-watcher-data.s3-us-east-2.amazonaws.com/aggregate/all_transactions.json",
-        "https://senate-stock-watcher-data.s3.amazonaws.com/aggregate/all_transactions.json",
-    ]:
-        try:
-            data = safe_fetch_json(url, timeout=30)
-            if data and isinstance(data, list):
-                df = pd.DataFrame(data)
-                if "senator" in df.columns:
-                    df = df.rename(columns={"senator": "name"})
-                if "type" in df.columns:
-                    df = df.rename(columns={"type": "trade_type"})
-                df["chamber"] = "Senado"
-                df["source"]  = "Político"
-                return df
-        except Exception as e:
-            errors.append(f"S3 Senate: {str(e)[:80]}")
-
-    raise ConnectionError("Senado — todas las fuentes fallaron:\n" + "\n".join(errors))
-
-
-@st.cache_data(ttl=14400, show_spinner=False)
-def load_house_trades(fmp_key: str = "") -> pd.DataFrame:
-    """
-    Carga trades de la Cámara de Representantes.
-
-    Orden de fuentes:
-      1. Financial Modeling Prep (FMP) — 250 llamadas/día gratis, requiere clave
-      2. S3 House Stock Watcher (legado, puede estar caído)
-    TTL: 4 horas
-    """
-    errors = []
-
-    # ── 1. Financial Modeling Prep API ────────────────────────────────────
-    if fmp_key:
-        try:
-            data = safe_fetch_json(
-                f"https://financialmodelingprep.com/api/v4/house-trading?apikey={fmp_key}",
-                timeout=30
-            )
-            if data and isinstance(data, list) and len(data) > 0:
-                return _normalize_fmp_congress(data, "Cámara de Representantes")
-        except Exception as e:
-            errors.append(f"FMP House: {str(e)[:100]}")
-
-    # ── 2. S3 legado ──────────────────────────────────────────────────────
-    for url in [
-        "https://house-stock-watcher-data.s3-us-east-2.amazonaws.com/data/all_transactions.json",
-        "https://house-stock-watcher-data.s3.amazonaws.com/data/all_transactions.json",
-    ]:
-        try:
-            data = safe_fetch_json(url, timeout=30)
-            if data and isinstance(data, list):
-                df = pd.DataFrame(data)
-                for col in ["representative", "owner"]:
-                    if col in df.columns:
-                        df = df.rename(columns={col: "name"})
-                        break
-                if "type" in df.columns:
-                    df = df.rename(columns={"type": "trade_type"})
-                df["chamber"] = "Cámara de Representantes"
-                df["source"]  = "Político"
-                return df
-        except Exception as e:
-            errors.append(f"S3 House: {str(e)[:80]}")
-
-    raise ConnectionError("Cámara — todas las fuentes fallaron:\n" + "\n".join(errors))
-
-
+        parts_fmp = []
+        for endpoint, chamber in [
+            (f"https://financialmodelingprep.com/api/v4/senate-trading?apikey={fmp_key}", "Senado"),
+            (f"https://financialmodelingprep.com/api/v4/house-trading?apikey={fmp_key}", "Cámara de Representantes"),
+        ]:
+            try:
+                data = safe_fetch_json(endpoint, timeout=30)
+                if data and isinstance(data, list) and len(data) > 0:
+                    parts_fmp.append(_normalize_fmp_congress(data, chamber))
+            except Exception as e:
+                errors.append(f"FMP {chamber}: {str(e)[:80]}")
+        if parts_fmp:
+            return pd.concat(parts_fmp, ignore_index=True)
+ 
+    raise ConnectionError("Congreso — todas las fuentes fallaron:\n" + "\n".join(errors))
+ 
+ 
 def _robust_parse_date(series: pd.Series) -> pd.Series:
     """
     Intenta parsear fechas en múltiples formatos comunes de los datos del Congreso.
@@ -274,7 +260,7 @@ def _robust_parse_date(series: pd.Series) -> pd.Series:
     """
     # Primero intentar el formato estándar ISO
     result = pd.to_datetime(series, errors="coerce", dayfirst=False)
-
+ 
     # Para los que fallaron (NaT), intentar formato MM/DD/YYYY explícitamente
     nat_mask = result.isna()
     if nat_mask.any():
@@ -285,7 +271,7 @@ def _robust_parse_date(series: pd.Series) -> pd.Series:
         )
         result = result.copy()
         result[nat_mask] = fallback
-
+ 
     # Segundo fallback: MM/DD/YY
     nat_mask2 = result.isna()
     if nat_mask2.any():
@@ -296,17 +282,17 @@ def _robust_parse_date(series: pd.Series) -> pd.Series:
         )
         result = result.copy()
         result[nat_mask2] = fallback2
-
+ 
     return result
-
-
+ 
+ 
 def normalize_congressional(df: pd.DataFrame) -> pd.DataFrame:
     """Limpia y normaliza columnas del DataFrame del Congreso."""
     # Parsear fechas con parser robusto multi-formato
     for col in ["transaction_date", "disclosure_date"]:
         if col in df.columns:
             df[col] = _robust_parse_date(df[col].astype(str).replace("--", pd.NaT).replace("N/A", pd.NaT))
-
+ 
     # Tipo de operación legible
     if "trade_type" in df.columns:
         def classify(val):
@@ -319,24 +305,24 @@ def normalize_congressional(df: pd.DataFrame) -> pd.DataFrame:
         df["trade_type_clean"] = df["trade_type"].apply(classify)
     else:
         df["trade_type_clean"] = "N/D"
-
+ 
     # Limpiar ticker
     if "ticker" in df.columns:
         df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
         df = df[~df["ticker"].isin(["", "--", "N/A", "NAN", "NONE", "NA"])]
         df = df[df["ticker"].notna()]
-
+ 
     # Limpiar nombre
     if "name" in df.columns:
         df["name"] = df["name"].astype(str).str.strip()
-
+ 
     return df
-
-
+ 
+ 
 # ─────────────────────────────────────────────
 # CARGA DE DATOS DE INSIDERS — DATAROMA
 # ─────────────────────────────────────────────
-
+ 
 # Headers que simulan un navegador real (necesario para algunos sitios)
 BROWSER_HEADERS = {
     "User-Agent": (
@@ -350,8 +336,8 @@ BROWSER_HEADERS = {
     "Referer":         "https://www.dataroma.com/",
     "Connection":      "keep-alive",
 }
-
-
+ 
+ 
 def _parse_number(text: str) -> float:
     """
     Convierte un string numérico con formato financiero a float.
@@ -374,8 +360,8 @@ def _parse_number(text: str) -> float:
         return float(t) * multiplier
     except (ValueError, TypeError):
         return 0.0
-
-
+ 
+ 
 def _extract_ticker_from_cell(cell) -> tuple[str, str]:
     """
     Extrae ticker y nombre de empresa desde una celda HTML de Dataroma.
@@ -385,14 +371,14 @@ def _extract_ticker_from_cell(cell) -> tuple[str, str]:
       - Solo texto "AAPL"         → ('AAPL', 'AAPL')
     """
     text = cell.get_text(strip=True)
-
+ 
     # Formato: "Nombre de Empresa (TICKER)"
     m = re.search(r'\(([A-Z]{1,5}(?:\.[A-Z])?)\)\s*$', text)
     if m:
         ticker  = m.group(1)
         company = text[: m.start()].strip(" -–")
         return ticker, company
-
+ 
     # Ticker en parámetro de enlace: href="...?t=AAPL" o "...t=AAPL&..."
     link = cell.find("a")
     if link and link.get("href"):
@@ -400,14 +386,14 @@ def _extract_ticker_from_cell(cell) -> tuple[str, str]:
         m2 = re.search(r'[?&]t=([A-Z]{1,5}(?:\.[A-Z])?)', href)
         if m2:
             return m2.group(1), text
-
+ 
     # Si el texto es solo el ticker (todo mayúsculas, 1-5 chars)
     if re.fullmatch(r'[A-Z]{1,5}(?:\.[A-Z])?', text):
         return text, text
-
+ 
     return "—", text
-
-
+ 
+ 
 def _scrape_dataroma_page(url: str) -> list[dict]:
     """
     Descarga y parsea UNA página de Dataroma.
@@ -416,9 +402,9 @@ def _scrape_dataroma_page(url: str) -> list[dict]:
     r = requests.get(url, headers=BROWSER_HEADERS, timeout=30)
     if r.status_code != 200:
         raise ConnectionError(f"HTTP {r.status_code} desde {url}")
-
+ 
     soup = BeautifulSoup(r.content, "html.parser")
-
+ 
     # ── Buscar la tabla principal ─────────────────────────────────────────
     # Dataroma usa distintos selectores según la sección
     table = None
@@ -437,18 +423,18 @@ def _scrape_dataroma_page(url: str) -> list[dict]:
                     break
         except Exception:
             continue
-
+ 
     if not table:
         raise ValueError(f"No se encontró tabla en: {url}")
-
+ 
     rows = table.find_all("tr")
     if len(rows) < 2:
         return []
-
+ 
     # ── Detectar cabeceras ────────────────────────────────────────────────
     header_cells = rows[0].find_all(["th", "td"])
     col_names = [c.get_text(strip=True).lower() for c in header_cells]
-
+ 
     # ── Mapear columnas por nombre ────────────────────────────────────────
     def col_idx(*keywords) -> int | None:
         for kw in keywords:
@@ -456,7 +442,7 @@ def _scrape_dataroma_page(url: str) -> list[dict]:
                 if kw in h:
                     return i
         return None
-
+ 
     idx_date    = col_idx("date", "fecha")
     idx_company = col_idx("company", "stock", "empresa", "ticker")
     idx_insider = col_idx("insider", "name", "nombre")
@@ -465,23 +451,23 @@ def _scrape_dataroma_page(url: str) -> list[dict]:
     idx_shares  = col_idx("share", "qty", "cantidad")
     idx_price   = col_idx("price", "avg", "precio")
     idx_value   = col_idx("value", "total", "valor", "amount")
-
+ 
     trades = []
     for row in rows[1:]:
         cells = row.find_all("td")
         n = len(cells)
         if n < 3:
             continue
-
+ 
         def get(idx, default="N/D"):
             if idx is not None and idx < n:
                 return cells[idx].get_text(strip=True)
             return default
-
+ 
         # Extraer ticker y empresa
         comp_idx = idx_company if idx_company is not None else 1
         ticker, company = _extract_ticker_from_cell(cells[comp_idx] if comp_idx < n else cells[0])
-
+ 
         # Tipo de operación
         action_raw = get(idx_action, get(4, "N/D"))
         a_low = action_raw.lower()
@@ -491,18 +477,18 @@ def _scrape_dataroma_page(url: str) -> list[dict]:
             trade_type_clean = "Venta"
         else:
             trade_type_clean = action_raw.title()
-
+ 
         # Valores numéricos
         shares_raw = get(idx_shares, get(5, "0"))
         price_raw  = get(idx_price,  get(6, "0"))
         value_raw  = get(idx_value,  get(7, "0"))
-
+ 
         shares = int(_parse_number(shares_raw))
         price  = round(_parse_number(price_raw), 2)
         total  = _parse_number(value_raw)
         if total == 0 and shares > 0 and price > 0:
             total = round(shares * price, 0)
-
+ 
         trade = {
             "transaction_date": get(idx_date, get(0, "")),
             "company":          company,
@@ -518,10 +504,10 @@ def _scrape_dataroma_page(url: str) -> list[dict]:
             "source":           "Insider (Dataroma)",
         }
         trades.append(trade)
-
+ 
     return trades
-
-
+ 
+ 
 @st.cache_data(ttl=7200, show_spinner=False)
 def load_insider_trades() -> pd.DataFrame:
     """
@@ -534,7 +520,7 @@ def load_insider_trades() -> pd.DataFrame:
     dataroma_error = None
     try:
         all_trades: list[dict] = []
-
+ 
         # Página principal de insiders de Dataroma
         # (muestra los últimos 100–200 insiders con transacciones recientes)
         for page_url in [
@@ -550,17 +536,17 @@ def load_insider_trades() -> pd.DataFrame:
                 time.sleep(0.5)  # Ser respetuoso con el servidor
             except Exception:
                 break
-
+ 
         if all_trades:
             df = pd.DataFrame(all_trades)
             if "transaction_date" in df.columns:
                 df["transaction_date"] = _robust_parse_date(df["transaction_date"].astype(str))
             df["chamber"] = df["title"].fillna("N/D")
             return df
-
+ 
     except Exception as e:
         dataroma_error = str(e)
-
+ 
     # ── 2. Respaldo: SEC EDGAR Form 4 Feed ────────────────────────────────
     # Solo si Dataroma falla (por bloqueo, mantenimiento, etc.)
     edgar_trades: list[dict] = []
@@ -572,10 +558,10 @@ def load_insider_trades() -> pd.DataFrame:
         )
         r = requests.get(feed_url, headers=HEADERS, timeout=30)
         r.raise_for_status()
-
+ 
         root_xml = ET.fromstring(r.content)
         ns = {"atom": "http://www.w3.org/2005/Atom"}
-
+ 
         for entry in root_xml.findall("atom:entry", ns)[:20]:
             try:
                 link_el = entry.find("atom:link", ns)
@@ -585,23 +571,23 @@ def load_insider_trades() -> pd.DataFrame:
                 idx_r = requests.get(idx_url, headers=HEADERS, timeout=10)
                 if idx_r.status_code != 200:
                     continue
-
+ 
                 xml_paths = re.findall(r'href="(/Archives/edgar/data/[^"]+\.xml)"', idx_r.text)
                 if not xml_paths:
                     continue
-
+ 
                 xml_r = requests.get("https://www.sec.gov" + xml_paths[0], headers=HEADERS, timeout=10)
                 if xml_r.status_code != 200:
                     continue
-
+ 
                 edgar_trades.extend(_parse_form4_xml(xml_r.content))
                 time.sleep(0.15)
             except Exception:
                 continue
-
+ 
     except Exception:
         pass
-
+ 
     if edgar_trades:
         df = pd.DataFrame(edgar_trades)
         if "transaction_date" in df.columns:
@@ -609,15 +595,15 @@ def load_insider_trades() -> pd.DataFrame:
         if dataroma_error:
             st.sidebar.info(f"ℹ️ Insiders: usando SEC EDGAR como respaldo (Dataroma: {dataroma_error[:60]})")
         return df
-
+ 
     # ── 3. Nada funcionó ─────────────────────────────────────────────────
     raise ConnectionError(
         "No se pudieron cargar datos de insiders.\n"
         f"Dataroma: {dataroma_error or 'sin datos'}\n"
         "SEC EDGAR: sin resultados"
     )
-
-
+ 
+ 
 def _parse_form4_xml(xml_bytes: bytes) -> list[dict]:
     """Parsea un XML de Formulario 4 de SEC EDGAR (usado como respaldo)."""
     trades = []
@@ -630,7 +616,7 @@ def _parse_form4_xml(xml_bytes: bytes) -> list[dict]:
         title    = root.findtext(".//officerTitle", "").strip()
         is_dir   = root.findtext(".//isDirector", "0")
         role     = title if (is_off == "1" and title) else ("Director" if is_dir == "1" else "Accionista")
-
+ 
         for tx in root.findall(".//nonDerivativeTransaction"):
             date   = tx.findtext("transactionDate/value", "").strip()
             sh_s   = tx.findtext("transactionAmounts/transactionShares/value", "0")
@@ -644,7 +630,7 @@ def _parse_form4_xml(xml_bytes: bytes) -> list[dict]:
                 total  = round(shares * price, 0)
             except (ValueError, TypeError):
                 shares, price, total = 0, 0, 0
-
+ 
             trades.append({
                 "name":             owner,
                 "company":          company,
@@ -663,12 +649,12 @@ def _parse_form4_xml(xml_bytes: bytes) -> list[dict]:
     except ET.ParseError:
         pass
     return trades
-
-
+ 
+ 
 # ─────────────────────────────────────────────
 # FUNCIONES DE UTILIDAD
 # ─────────────────────────────────────────────
-
+ 
 def date_cutoff(selection: str) -> pd.Timestamp:
     """Convierte selección de rango a timestamp de inicio."""
     now = pd.Timestamp.now()
@@ -679,8 +665,8 @@ def date_cutoff(selection: str) -> pd.Timestamp:
         "Último año":       now - pd.Timedelta(days=365),
         "Todo el historial": pd.Timestamp("2010-01-01"),
     }.get(selection, now - pd.Timedelta(days=30))
-
-
+ 
+ 
 def metric_row(df: pd.DataFrame):
     """Muestra fila de métricas clave."""
     c1, c2, c3, c4 = st.columns(4)
@@ -692,12 +678,12 @@ def metric_row(df: pd.DataFrame):
         sells = (df["trade_type_clean"] == "Venta").sum()
         c3.metric("🟢 Compras", f"{buys:,}")
         c4.metric("🔴 Ventas",  f"{sells:,}")
-
-
+ 
+ 
 # ─────────────────────────────────────────────
 # INTERFAZ PRINCIPAL
 # ─────────────────────────────────────────────
-
+ 
 def main():
     # ── Encabezado ──────────────────────────────
     st.title("📊 US Trade Tracker")
@@ -706,50 +692,50 @@ def main():
         "e insiders de EE.UU. — Datos 100% gratuitos y públicos._"
     )
     st.divider()
-
+ 
     # ── Barra lateral de filtros ─────────────────
     with st.sidebar:
         st.header("🔍 Filtros")
-
+ 
         fuentes = st.multiselect(
             "¿Qué quieres ver?",
             ["Políticos (Congreso)", "Insiders Corporativos"],
             default=["Políticos (Congreso)", "Insiders Corporativos"],
         )
-
+ 
         rango = st.selectbox(
             "Período de tiempo",
             ["Últimos 7 días", "Últimos 30 días", "Últimos 90 días",
              "Último año", "Todo el historial"],
             index=3,  # Default: Último año (evita perder datos por fechas mal parseadas)
         )
-
+ 
         tipo_op = st.multiselect(
             "Tipo de operación",
             ["Compra", "Venta"],
             default=["Compra", "Venta"],
         )
-
+ 
         ticker_input = st.text_input("Buscar por ticker (ej: AAPL, NVDA)", "").upper().strip()
         nombre_input = st.text_input("Buscar por nombre", "").strip().lower()
-
+ 
         st.divider()
         st.markdown("**📡 Fuentes de datos:**")
-        st.markdown("• [House Stock Watcher](https://housestockwatcher.com)")
-        st.markdown("• [Senate Stock Watcher](https://senatestockwatcher.com)")
+        st.markdown("• [Quiver Quantitative](https://www.quiverquant.com/congresstrading/)")
         st.markdown("• [SEC EDGAR Form 4](https://www.sec.gov/cgi-bin/browse-edgar)")
+        st.markdown("• [Dataroma](https://www.dataroma.com/m/ins/ins.php)")
         st.divider()
-        st.caption("🔄 Datos del Congreso: cada 4h")
+        st.caption("🔄 Datos del Congreso: cada 2h")
         st.caption("🔄 Datos de Insiders: cada 2h")
         st.caption(f"⏰ Sesión iniciada: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
-
+ 
     start = date_cutoff(rango)
-
+ 
     # ── Tabs ──────────────────────────────────────
     tab_cong, tab_ins, tab_info = st.tabs(
         ["🏛️ Políticos del Congreso", "💼 Insiders Corporativos", "ℹ️ Acerca de"]
     )
-
+ 
     # ════════════════════════════════════════════
     # TAB 1 — POLÍTICOS
     # ════════════════════════════════════════════
@@ -757,57 +743,68 @@ def main():
         if "Políticos (Congreso)" not in fuentes:
             st.info("Activa **Políticos (Congreso)** en el panel de filtros para ver estos datos.")
         else:
-            # ── Leer clave FMP SOLO si está explícitamente configurada ────────
-            # FMP es OPCIONAL — solo para datos de la Cámara de Representantes.
-            # Si no está configurada, el sistema usa solo datos del Senado (que sí funcionan).
-            fmp_key = ""
+            # ── Leer claves API de Streamlit Secrets ─────────────────────────
+            # QUIVER_API_KEY: fuente principal (quiverquant.com — gratis con registro)
+            # FMP_API_KEY: respaldo opcional (financialmodelingprep.com — gratis con registro)
+            quiver_key, fmp_key = "", ""
             try:
-                raw_key = st.secrets.get("FMP_API_KEY", "")
-                # Validar que sea una clave real (mínimo 20 caracteres alfanuméricos)
-                if raw_key and isinstance(raw_key, str) and len(raw_key.strip()) >= 20:
-                    fmp_key = raw_key.strip()
+                rk = st.secrets.get("QUIVER_API_KEY", "")
+                if rk and isinstance(rk, str) and len(rk.strip()) >= 10:
+                    quiver_key = rk.strip()
+            except Exception:
+                quiver_key = ""
+            try:
+                rk2 = st.secrets.get("FMP_API_KEY", "")
+                if rk2 and isinstance(rk2, str) and len(rk2.strip()) >= 20:
+                    fmp_key = rk2.strip()
             except Exception:
                 fmp_key = ""
-
-            with st.spinner("⏳ Cargando datos del Congreso (primera carga puede tardar ~20 seg)..."):
-                df_h, df_s = pd.DataFrame(), pd.DataFrame()
+ 
+            with st.spinner("⏳ Cargando datos del Congreso desde Quiver Quantitative..."):
                 errors_cong = []
-
-                # Senado siempre se intenta (fuente GitHub gratuita)
+                df_c_raw = pd.DataFrame()
+ 
                 try:
-                    df_s = load_senate_trades(fmp_key=fmp_key)
+                    df_c_raw = load_congress_trades(quiver_key=quiver_key, fmp_key=fmp_key)
                 except Exception as e:
-                    errors_cong.append(f"Senado: {str(e)[:200]}")
-
-                # Cámara solo si hay clave FMP válida (evita llamadas 401 inútiles)
-                if fmp_key:
-                    try:
-                        df_h = load_house_trades(fmp_key=fmp_key)
-                    except Exception as e:
-                        errors_cong.append(f"Cámara: {str(e)[:200]}")
-
-                if df_h.empty and df_s.empty:
-                    st.error("⚠️ No se pudieron cargar los datos del Senado.")
-                    st.info("Intenta recargar la página en unos minutos. Si el problema persiste, la fuente GitHub puede estar temporalmente caída.")
+                    errors_cong.append(str(e)[:300])
+ 
+                if df_c_raw.empty:
+                    st.error("⚠️ No se pudieron cargar datos del Congreso.")
+                    st.info(
+                        "Asegúrate de haber configurado tu clave gratuita de Quiver Quantitative en "
+                        "Streamlit Secrets. Ve a la pestaña **ℹ️ Acerca de** para instrucciones."
+                    )
+                    if errors_cong:
+                        with st.expander("Ver detalle del error"):
+                            st.code("\n".join(errors_cong))
                     cong_ok = False
                 else:
-                    parts = [df for df in [df_h, df_s] if not df.empty]
-                    df_c = normalize_congressional(pd.concat(parts, ignore_index=True))
+                    df_c = normalize_congressional(df_c_raw)
                     cong_ok = True
-                    # Mostrar banner de Cámara solo si no hay clave FMP
-                    if not fmp_key:
-                        st.info(
-                            "ℹ️ Mostrando datos del **Senado**. "
-                            "Para agregar la **Cámara de Representantes**, obtén una clave gratuita en "
-                            "[financialmodelingprep.com/register](https://financialmodelingprep.com/register) "
-                            "y agrégala en el código o en los Secrets de Streamlit."
+ 
+                    # Banner informativo según fuente activa
+                    if quiver_key:
+                        n_senate  = (df_c.get("chamber", pd.Series()) == "Senado").sum()
+                        n_house   = (df_c.get("chamber", pd.Series()) == "Cámara de Representantes").sum()
+                        st.success(
+                            f"✅ Datos de **Quiver Quantitative** — "
+                            f"Senado: {n_senate:,} | Cámara: {n_house:,} transacciones"
                         )
-                    elif errors_cong:
+                    else:
+                        st.info(
+                            "ℹ️ Mostrando datos del **Senado** (respaldo). "
+                            "Para ver **ambas cámaras + partidos**, configura tu clave gratuita de "
+                            "[Quiver Quantitative](https://www.quiverquant.com/signup) "
+                            "en Streamlit Secrets → `QUIVER_API_KEY`. "
+                            "Ver instrucciones en la pestaña **ℹ️ Acerca de**."
+                        )
+                    if errors_cong:
                         st.warning("⚠️ Datos parciales: " + " | ".join(errors_cong))
-
+ 
             if cong_ok and not df_c.empty:
                 total_loaded = len(df_c)
-
+ 
                 # ── Diagnóstico de fechas (ayuda a detectar problemas de parsing) ──
                 if "transaction_date" in df_c.columns:
                     n_nat = df_c["transaction_date"].isna().sum()
@@ -817,37 +814,37 @@ def main():
                             f"⚠️ {n_nat:,} de {total_loaded:,} registros ({pct}%) tienen fecha sin parsear — "
                             "se mostrarán igual pero no se pueden filtrar por fecha."
                         )
-
+ 
                 # ── Aplicar filtros ──────────────
                 mask = pd.Series([True] * len(df_c), index=df_c.index)
-
+ 
                 if "transaction_date" in df_c.columns:
                     mask &= df_c["transaction_date"].fillna(pd.Timestamp("2000-01-01")) >= start
-
+ 
                 if tipo_op:
                     mask &= df_c["trade_type_clean"].isin(tipo_op)
-
+ 
                 if ticker_input and "ticker" in df_c.columns:
                     mask &= df_c["ticker"] == ticker_input
-
+ 
                 if nombre_input and "name" in df_c.columns:
                     mask &= df_c["name"].str.lower().str.contains(nombre_input, na=False)
-
+ 
                 df_f = df_c[mask].sort_values("transaction_date", ascending=False, na_position="last")
-
+ 
                 # Si el filtro de fecha dejó 0 resultados pero había datos, avisar al usuario
                 if len(df_f) == 0 and total_loaded > 0:
                     st.warning(
                         f"ℹ️ Se cargaron **{total_loaded:,}** registros pero el filtro **{rango}** no mostró ninguno. "
                         "Prueba a seleccionar **'Todo el historial'** en el selector de período."
                     )
-
+ 
                 metric_row(df_f)
                 st.divider()
-
+ 
                 # ── Gráficos ─────────────────────
                 g1, g2 = st.columns(2)
-
+ 
                 with g1:
                     st.subheader("🏆 Políticos más activos")
                     if "name" in df_f.columns and len(df_f) > 0:
@@ -860,7 +857,7 @@ def main():
                                           coloraxis_showscale=False,
                                           yaxis=dict(categoryorder="total ascending"))
                         st.plotly_chart(fig, use_container_width=True)
-
+ 
                 with g2:
                     st.subheader("📊 Acciones más transaccionadas")
                     if "ticker" in df_f.columns and len(df_f) > 0:
@@ -871,7 +868,7 @@ def main():
                         fig2.update_layout(height=360, showlegend=False,
                                            coloraxis_showscale=False)
                         st.plotly_chart(fig2, use_container_width=True)
-
+ 
                 # ── Compras vs Ventas por partido ─
                 if "party" in df_f.columns and "trade_type_clean" in df_f.columns:
                     st.subheader("🗳️ Compras vs Ventas por partido")
@@ -888,10 +885,10 @@ def main():
                                           "trade_type_clean": "Tipo"})
                     fig3.update_layout(height=320)
                     st.plotly_chart(fig3, use_container_width=True)
-
+ 
                 # ── Tabla de datos ────────────────
                 st.subheader(f"📋 Transacciones ({len(df_f):,} resultados)")
-
+ 
                 COLS_CONG = {
                     "transaction_date": "Fecha",
                     "name":             "Político",
@@ -905,12 +902,12 @@ def main():
                 }
                 show = [c for c in COLS_CONG if c in df_f.columns]
                 df_show = df_f[show].rename(columns=COLS_CONG).copy()
-
+ 
                 if "Fecha" in df_show.columns:
                     df_show["Fecha"] = pd.to_datetime(df_show["Fecha"]).dt.strftime("%d/%m/%Y")
-
+ 
                 st.dataframe(df_show, use_container_width=True, height=420, hide_index=True)
-
+ 
     # ════════════════════════════════════════════
     # TAB 2 — INSIDERS
     # ════════════════════════════════════════════
@@ -929,38 +926,38 @@ def main():
                         f"Intenta recargar en unos minutos.\n\nDetalle: {str(e)[:200]}"
                     )
                     ins_ok = False
-
+ 
             if ins_ok and not df_ins.empty:
                 # ── Filtros ───────────────────────
                 mask_i = pd.Series([True] * len(df_ins), index=df_ins.index)
-
+ 
                 if "transaction_date" in df_ins.columns:
                     mask_i &= df_ins["transaction_date"].fillna(pd.Timestamp("2000-01-01")) >= start
-
+ 
                 if tipo_op and "trade_type_clean" in df_ins.columns:
                     mask_i &= df_ins["trade_type_clean"].isin(tipo_op)
-
+ 
                 if ticker_input and "ticker" in df_ins.columns:
                     mask_i &= df_ins["ticker"].str.upper() == ticker_input
-
+ 
                 if nombre_input and "name" in df_ins.columns:
                     mask_i &= df_ins["name"].str.lower().str.contains(nombre_input, na=False)
-
+ 
                 df_fi = df_ins[mask_i].sort_values("transaction_date", ascending=False, na_position="last")
-
+ 
                 if len(df_fi) == 0 and len(df_ins) > 0:
                     st.warning(
                         f"ℹ️ Se cargaron **{len(df_ins):,}** registros de insiders pero el filtro "
                         f"**{rango}** no mostró ninguno. "
                         "Prueba a seleccionar **'Todo el historial'** en el selector de período."
                     )
-
+ 
                 metric_row(df_fi)
                 st.divider()
-
+ 
                 # ── Gráficos ─────────────────────
                 g3, g4 = st.columns(2)
-
+ 
                 with g3:
                     st.subheader("🏢 Empresas con más insiders activos")
                     if "company" in df_fi.columns and len(df_fi) > 0:
@@ -973,7 +970,7 @@ def main():
                                            coloraxis_showscale=False,
                                            yaxis=dict(categoryorder="total ascending"))
                         st.plotly_chart(fig4, use_container_width=True)
-
+ 
                 with g4:
                     st.subheader("💰 Top 10 transacciones por valor")
                     if "total_value" in df_fi.columns and len(df_fi) > 0:
@@ -988,10 +985,10 @@ def main():
                                               "trade_type_clean": "Tipo"})
                         fig5.update_layout(height=360)
                         st.plotly_chart(fig5, use_container_width=True)
-
+ 
                 # ── Tabla ─────────────────────────
                 st.subheader(f"📋 Transacciones recientes ({len(df_fi):,} resultados)")
-
+ 
                 COLS_INS = {
                     "transaction_date": "Fecha",
                     "name":             "Insider",
@@ -1005,75 +1002,77 @@ def main():
                 }
                 show_i = [c for c in COLS_INS if c in df_fi.columns]
                 df_show_i = df_fi[show_i].rename(columns=COLS_INS).copy()
-
+ 
                 if "Fecha" in df_show_i.columns:
                     df_show_i["Fecha"] = pd.to_datetime(df_show_i["Fecha"]).dt.strftime("%d/%m/%Y")
-
+ 
                 if "Valor total (USD)" in df_show_i.columns:
                     df_show_i["Valor total (USD)"] = df_show_i["Valor total (USD)"].apply(
                         lambda x: f"${x:,.0f}" if pd.notna(x) and x > 0 else "N/D"
                     )
-
+ 
                 st.dataframe(df_show_i, use_container_width=True, height=420, hide_index=True)
-
+ 
             elif ins_ok:
                 st.warning("No se encontraron datos de insiders para el período seleccionado.")
-
+ 
     # ════════════════════════════════════════════
     # TAB 3 — INFORMACIÓN
     # ════════════════════════════════════════════
     with tab_info:
         col_a, col_b = st.columns(2)
-
+ 
         with col_a:
             st.subheader("📡 Fuentes de datos")
             st.markdown("""
 **🏛️ Políticos del Congreso (STOCK Act)**
 - Todos los miembros del Congreso están obligados a declarar sus operaciones
   financieras en un plazo de **45 días** según el STOCK Act (2012).
-- Fuentes utilizadas (en orden de prioridad):
-  - **Senado**: [Senate Stock Watcher en GitHub](https://github.com/timothycarambat/senate-stock-watcher-data) — gratis, sin configuración
-  - **Cámara + Senado**: [Financial Modeling Prep API](https://financialmodelingprep.com) — gratis con clave (ver abajo)
-
+- Fuente principal: **[Quiver Quantitative](https://www.quiverquant.com/congresstrading/)** — incluye Senado + Cámara + partido político *(clave gratuita, ver abajo)*
+- Respaldo automático: GitHub Senate Stock Watcher *(sin clave, solo Senado)*
+ 
 **💼 Insiders Corporativos (Form 4)**
 - CEOs, directores y ejecutivos deben reportar sus operaciones en **2 días hábiles**.
-- Fuente oficial: [SEC EDGAR](https://www.sec.gov/cgi-bin/browse-edgar)
-- Los datos corresponden a los formularios más recientes disponibles.
+- Fuente: [Dataroma](https://www.dataroma.com/m/ins/ins.php) + [SEC EDGAR](https://www.sec.gov/cgi-bin/browse-edgar) como respaldo.
             """)
-            st.subheader("🔑 Configurar clave gratuita (para datos de la Cámara)")
+ 
+            st.subheader("🔑 Configurar clave gratuita de Quiver Quantitative")
             st.markdown("""
-Para ver los trades de la **Cámara de Representantes**, necesitas una clave gratuita de Financial Modeling Prep:
-
-1. Regístrate en **[financialmodelingprep.com/register](https://financialmodelingprep.com/register)** *(gratis, sin tarjeta)*
-2. Ve a tu [dashboard](https://financialmodelingprep.com/developer/docs/dashboard) y copia tu API key
+Quiver Quantitative es la fuente más completa: incluye **Senado + Cámara** con información de **partido político** de cada legislador.
+ 
+**Pasos para obtener tu clave gratis:**
+ 
+1. Ve a **[quiverquant.com/signup](https://www.quiverquant.com/signup)** y crea una cuenta gratuita *(no requiere tarjeta)*
+2. Una vez dentro, ve a tu perfil → **API Key** y copia tu clave
 3. En Streamlit Cloud → tu app → ⚙️ **Settings** → **Secrets** → agrega:
 ```
-FMP_API_KEY = "tu_clave_aqui"
+QUIVER_API_KEY = "tu_clave_aqui"
 ```
-4. Guarda y recarga → aparecerán los datos de la Cámara automáticamente.
-
-> El plan gratuito permite 250 llamadas/día — más que suficiente.
+4. Haz clic en **Save** y recarga el dashboard → verás ambas cámaras con datos de partido
+ 
+> El plan gratuito de Quiver permite consultas diarias sin límite estricto para uso personal.
+> Sin clave, el dashboard igual funciona con datos del Senado como respaldo automático.
             """)
-
+ 
         with col_b:
             st.subheader("⚙️ Frecuencia de actualización")
             st.markdown("""
 | Fuente | Actualización del dashboard |
 |---|---|
-| Cámara de Representantes | Cada 4 horas |
-| Senado | Cada 4 horas |
-| Insiders (Form 4) | Cada 2 horas |
-
+| Quiver Quantitative (Congreso) | Cada 2 horas |
+| Dataroma (Insiders) | Cada 2 horas |
+| SEC EDGAR (respaldo insiders) | Cada 2 horas |
+ 
 **⏱️ Desfase de datos:**
 - Los trades del Congreso pueden aparecer con hasta **45 días** de retraso
   (tiempo legal que tienen para declarar).
 - Los insiders corporativos aparecen con **1-2 días** de retraso.
-
+ 
 **📧 Alertas por email:**
 Las alertas diarias se envían automáticamente a las 9 AM ET
 a través de GitHub Actions (configurado aparte).
             """)
-
+ 
         st.divider()
         st.subheader("⚠️ Aviso legal")
         st.warning(
@@ -1082,7 +1081,7 @@ a través de GitHub Actions (configurado aparte).
             "Los datos provienen de fuentes públicas oficiales pero pueden contener errores o desfases. "
             "Siempre verifica la información en las fuentes originales antes de tomar decisiones."
         )
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
