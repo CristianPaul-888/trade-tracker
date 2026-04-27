@@ -101,48 +101,46 @@ def safe_fetch_json(url: str, timeout: int = 60, extra_headers: dict | None = No
 def _normalize_quiver_congress(data: list) -> pd.DataFrame:
     """
     Normaliza el formato JSON de Quiver Quantitative al esquema común.
-    Columnas reales que devuelve la API:
+    Columnas reales que devuelve la API (mezcla de PascalCase y minúsculas):
       Representative, BioGuideID, ReportDate, TransactionDate, ticker,
       trade_type, Range, House, amount, party, last_modified, TickerType,
-      asset_description, ExcessReturn, PriceChange, SPYChange, chamber, source
+      asset_description, ExcessReturn, PriceChange, SPYChange, chamber
+ 
+    Estrategia: primero convertir TODOS los nombres a minúsculas,
+    luego renombrar con el mapa (todo en minúsculas).
     """
     df = pd.DataFrame(data)
  
+    # ── Paso 1: normalizar TODOS los nombres de columna a minúsculas ──────
+    df.columns = [c.lower().strip() for c in df.columns]
+ 
+    # ── Paso 2: renombrar al esquema común (todo en minúsculas) ───────────
     rename_map = {
-        # Nombre del político
-        "Representative":  "name",
-        "Politician":      "name",        # nombre alternativo por si cambia
-        # Fechas
-        "TransactionDate": "transaction_date",   # fecha en que se realizó la operación
-        "ReportDate":      "disclosure_date",    # fecha en que entregó la declaración
-        "Date":            "transaction_date",   # nombre alternativo
-        "Filed":           "disclosure_date",    # nombre alternativo
-        # Monto / rango
-        "Range":           "amount",
-        "Amount":          "amount",
-        # Tipo de activo
-        "TickerType":      "asset_type",
+        "representative":  "name",           # nombre del político
+        "politician":      "name",
+        "transactiondate": "transaction_date",  # fecha de la operación
+        "date":            "transaction_date",
+        "reportdate":      "disclosure_date",   # fecha de declaración al Congreso
+        "filed":           "disclosure_date",
+        "range":           "amount_range",    # rango legible: "$1,001 - $15,000"
+        "tickertype":      "asset_type",
     }
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
  
-    # Mapear cámara a español — puede venir como "Chamber" (mayúscula) o "chamber" (minúscula)
-    for col in ["Chamber", "chamber"]:
-        if col in df.columns:
-            df["chamber"] = df[col].map({
-                "House":   "Cámara de Representantes",
-                "Senate":  "Senado",
-                "house":   "Cámara de Representantes",
-                "senate":  "Senado",
-            }).fillna(df[col])
-            if col == "Chamber":
-                df = df.drop(columns=["Chamber"])
-            break
+    # ── Paso 3: mapear cámara a español ───────────────────────────────────
+    if "chamber" in df.columns:
+        df["chamber"] = df["chamber"].str.strip().map({
+            "House":   "Cámara de Representantes",
+            "Senate":  "Senado",
+            "house":   "Cámara de Representantes",
+            "senate":  "Senado",
+        }).fillna(df["chamber"])
     else:
         df["chamber"] = "Congreso"
  
-    # Mapear partido a nombre completo
+    # ── Paso 4: mapear partido a nombre completo ──────────────────────────
     if "party" in df.columns:
-        df["party"] = df["party"].map({
+        df["party"] = df["party"].str.strip().map({
             "D":          "Demócrata",
             "R":          "Republicano",
             "I":          "Independiente",
@@ -150,9 +148,11 @@ def _normalize_quiver_congress(data: list) -> pd.DataFrame:
             "Republican": "Republicano",
         }).fillna(df["party"])
  
-    # Eliminar columnas internas que no aportan al usuario
-    drop_cols = [c for c in ["BioGuideID", "House", "last_modified",
-                              "ExcessReturn", "PriceChange", "SPYChange"] if c in df.columns]
+    # ── Paso 5: eliminar columnas internas que no aportan al usuario ──────
+    drop_cols = [c for c in [
+        "bioguideid", "house", "last_modified",
+        "excessreturn", "pricechange", "spychange", "amount"
+    ] if c in df.columns]
     if drop_cols:
         df = df.drop(columns=drop_cols)
  
@@ -828,13 +828,6 @@ def main():
             if cong_ok and not df_c.empty:
                 total_loaded = len(df_c)
  
-                # ── Diagnóstico: mostrar columnas reales si falta transaction_date ──
-                if "transaction_date" not in df_c.columns:
-                    st.warning(
-                        f"⚠️ La fuente de datos no incluye la columna 'transaction_date'. "
-                        f"Columnas disponibles: `{', '.join(df_c.columns.tolist())}`"
-                    )
- 
                 # ── Diagnóstico de fechas (ayuda a detectar problemas de parsing) ──
                 if "transaction_date" in df_c.columns:
                     n_nat = df_c["transaction_date"].isna().sum()
@@ -928,9 +921,10 @@ def main():
                     "party":            "Partido",
                     "state":            "Estado",
                     "ticker":           "Ticker",
-                    "asset_description":"Activo",
-                    "trade_type_clean": "Tipo",
-                    "amount":           "Monto estimado",
+                    "asset_description":"Empresa / Activo",
+                    "asset_type":       "Tipo de activo",
+                    "trade_type_clean": "Operación",
+                    "amount_range":     "Monto estimado",
                 }
                 show = [c for c in COLS_CONG if c in df_f.columns]
                 df_show = df_f[show].rename(columns=COLS_CONG).copy()
