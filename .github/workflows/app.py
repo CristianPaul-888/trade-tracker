@@ -102,30 +102,42 @@ def safe_fetch_json(url: str, timeout: int = 60, extra_headers: dict | None = No
 # (Quiver Quantitative y FMP eliminados — solo se usan fuentes oficiales del gobierno)
 
 
-def _github_watcher_records(data: list | dict, chamber: str) -> list[dict]:
+def _watcher_records_from_json(data, chamber: str) -> list[dict]:
     """
-    Convierte registros del formato Senate/House Stock Watcher (GitHub) al esquema interno.
+    Convierte una respuesta JSON del formato Senate/House Stock Watcher al esquema interno.
+    Maneja: array directo, {"data":[...]}, {"transactions":[...]}, {"results":[...]}, etc.
     """
+    # Desempaquetar si viene como dict
     if isinstance(data, dict):
-        data = data.get("data", [])
+        for key in ("data", "transactions", "results", "records"):
+            if isinstance(data.get(key), list):
+                data = data[key]
+                break
+        else:
+            for v in data.values():
+                if isinstance(v, list):
+                    data = v
+                    break
+
     if not isinstance(data, list):
         return []
 
     name_key = "senator" if chamber == "Senado" else "representative"
-    trades: list[dict] = []
+    trades = []
 
     for tx in data:
+        if not isinstance(tx, dict):
+            continue
         ticker = str(tx.get("ticker") or "").strip()
         asset  = str(tx.get("asset_description") or "").strip()
-        # Ignorar filas sin activo identificable
-        if not (ticker or asset) or ticker.upper() in ("--", "N/A", ""):
-            continue
+        if ticker in ("--", "N/A", "NA", ""):
+            ticker = "—"
         trades.append({
             "name":             str(tx.get(name_key) or tx.get("name") or "").strip(),
             "state":            str(tx.get("state") or "").strip(),
             "party":            str(tx.get("party") or "").strip(),
             "chamber":          chamber,
-            "ticker":           ticker if ticker not in ("--", "N/A", "") else "—",
+            "ticker":           ticker or "—",
             "asset_description": asset,
             "asset_type":       str(tx.get("asset_type") or "").strip(),
             "transaction_date": str(tx.get("transaction_date") or "").strip(),
@@ -137,123 +149,106 @@ def _github_watcher_records(data: list | dict, chamber: str) -> list[dict]:
     return trades
 
 
-def _fetch_senate_github(years_back: int = 1) -> list[dict]:
+def _try_urls(urls: list, timeout: int = 45) -> tuple:
     """
-    Obtiene trades del Senado desde Senate Stock Watcher (GitHub).
-    Mirror comunitario actualizado automáticamente desde las declaraciones oficiales.
-    Funciona desde Streamlit Cloud sin restricciones de red.
-    URL base: https://github.com/elemental-platform/senate-stock-watcher
+    Prueba una lista de URLs en orden. Devuelve (data, url_exitosa) o (None, ultimo_error).
     """
-    trades: list[dict] = []
-    current_year = datetime.now().year
-
-    # 1. Intentar archivos por año (más ligeros)
-    for year in range(current_year, current_year - years_back - 1, -1):
-        url = (
-            "https://raw.githubusercontent.com/elemental-platform/"
-            f"senate-stock-watcher/main/data/{year}.json"
-        )
+    last_err = "sin intentos"
+    for url in urls:
         try:
-            r = requests.get(url, headers=HEADERS_SIMPLE, timeout=30)
-            if r.status_code == 200:
-                records = _github_watcher_records(r.json(), "Senado")
-                trades.extend(records)
-        except Exception:
-            continue
+            r = requests.get(url, headers=BROWSER_HEADERS, timeout=timeout)
+            if r.status_code == 200 and r.text.strip():
+                return r.json(), url
+            last_err = f"HTTP {r.status_code} — {url}"
+        except requests.exceptions.ConnectionError as e:
+            last_err = f"Conexión rechazada — {url}: {str(e)[:80]}"
+        except requests.exceptions.Timeout:
+            last_err = f"Timeout — {url}"
+        except ValueError as e:
+            last_err = f"JSON inválido — {url}: {str(e)[:60]}"
+        except Exception as e:
+            last_err = f"Error — {url}: {str(e)[:80]}"
+    return None, last_err
 
-    # 2. Fallback: all_transactions.json (filtrado al último año)
+
+def _fetch_senate_watcher() -> tuple:
+    """
+    Obtiene trades del Senado desde Senate Stock Watcher.
+    Fuentes en orden (todas gratuitas, sin clave):
+      1. senatestockwatcher.com/api  (API pública directa, datos 2026)
+      2. GitHub timothycarambat/senate-stock-watcher-data (mirror oficial, rama master)
+      3. Misma rama main como alternativa
+    Devuelve (trades: list, error: str). Si hay datos, error es "".
+    """
+    SENATE_URLS = [
+        "https://senatestockwatcher.com/api",
+        "https://raw.githubusercontent.com/timothycarambat/senate-stock-watcher-data/master/aggregate/all_transactions.json",
+        "https://raw.githubusercontent.com/timothycarambat/senate-stock-watcher-data/main/aggregate/all_transactions.json",
+    ]
+
+    data, info = _try_urls(SENATE_URLS, timeout=45)
+    if data is None:
+        return [], f"Senate Watcher: {info}"
+
+    trades = _watcher_records_from_json(data, "Senado")
     if not trades:
-        try:
-            url = (
-                "https://raw.githubusercontent.com/elemental-platform/"
-                "senate-stock-watcher/main/data/all_transactions.json"
-            )
-            r = requests.get(url, headers=HEADERS_SIMPLE, timeout=60)
-            if r.status_code == 200:
-                cutoff = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
-                all_rec = _github_watcher_records(r.json(), "Senado")
-                trades = [t for t in all_rec if t.get("transaction_date", "") >= cutoff]
-        except Exception:
-            pass
+        return [], f"Senate Watcher: JSON vacío o formato inesperado (URL: {info})"
 
-    return trades
+    # Filtrar al último año si hay muchos datos históricos
+    cutoff = str(datetime.now().year - 1)
+    recent = [t for t in trades if str(t.get("transaction_date", "")) >= cutoff]
+    return (recent if recent else trades[-500:]), ""
 
 
-def _fetch_house_github(years_back: int = 1) -> list[dict]:
+def _fetch_house_watcher() -> tuple:
     """
-    Obtiene trades de la Cámara desde House Stock Watcher (GitHub).
-    Mirror comunitario actualizado automáticamente desde las declaraciones oficiales.
-    URL base: https://github.com/elemental-platform/house-stock-watcher
+    Obtiene trades de la Cámara desde House Stock Watcher.
+    Fuentes en orden (todas gratuitas, sin clave):
+      1. housestockwatcher.com/api  (API pública directa, datos 2026)
+      2. GitHub timothycarambat/house-stock-watcher-data (si existe)
+    Devuelve (trades: list, error: str). Si hay datos, error es "".
     """
-    trades: list[dict] = []
-    current_year = datetime.now().year
+    HOUSE_URLS = [
+        "https://housestockwatcher.com/api",
+        "https://raw.githubusercontent.com/timothycarambat/house-stock-watcher-data/master/aggregate/all_transactions.json",
+        "https://raw.githubusercontent.com/timothycarambat/house-stock-watcher-data/main/aggregate/all_transactions.json",
+    ]
 
-    # 1. Intentar archivos por año
-    for year in range(current_year, current_year - years_back - 1, -1):
-        url = (
-            "https://raw.githubusercontent.com/elemental-platform/"
-            f"house-stock-watcher/main/data/{year}.json"
-        )
-        try:
-            r = requests.get(url, headers=HEADERS_SIMPLE, timeout=30)
-            if r.status_code == 200:
-                records = _github_watcher_records(r.json(), "Cámara de Representantes")
-                trades.extend(records)
-        except Exception:
-            continue
+    data, info = _try_urls(HOUSE_URLS, timeout=45)
+    if data is None:
+        return [], f"House Watcher: {info}"
 
-    # 2. Fallback: all_transactions.json (filtrado al último año)
+    trades = _watcher_records_from_json(data, "Cámara de Representantes")
     if not trades:
-        try:
-            url = (
-                "https://raw.githubusercontent.com/elemental-platform/"
-                "house-stock-watcher/main/data/all_transactions.json"
-            )
-            r = requests.get(url, headers=HEADERS_SIMPLE, timeout=60)
-            if r.status_code == 200:
-                cutoff = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
-                all_rec = _github_watcher_records(r.json(), "Cámara de Representantes")
-                trades = [t for t in all_rec if t.get("transaction_date", "") >= cutoff]
-        except Exception:
-            pass
+        return [], f"House Watcher: JSON vacío o formato inesperado (URL: {info})"
 
-    return trades
+    cutoff = str(datetime.now().year - 1)
+    recent = [t for t in trades if str(t.get("transaction_date", "")) >= cutoff]
+    return (recent if recent else trades[-500:]), ""
 
 
 @st.cache_data(ttl=7200, show_spinner=False)
 def load_congress_trades() -> pd.DataFrame:
     """
-    Carga trades del Congreso desde Senate + House Stock Watcher (GitHub).
+    Carga trades del Congreso desde Senate + House Stock Watcher.
 
     Fuentes (gratuitas, sin clave, accesibles desde Streamlit Cloud):
-      1. Senate Stock Watcher — github.com/elemental-platform/senate-stock-watcher
-      2. House Stock Watcher  — github.com/elemental-platform/house-stock-watcher
-    Ambos mirrors se actualizan automáticamente desde las declaraciones oficiales.
+      1. senatestockwatcher.com/api + GitHub timothycarambat/senate-stock-watcher-data
+      2. housestockwatcher.com/api  + GitHub timothycarambat/house-stock-watcher-data
     TTL: 2 horas
     """
-    errors = []
+    senate_trades, senate_err = _fetch_senate_watcher()
+    house_trades,  house_err  = _fetch_house_watcher()
 
-    # ── 1. Senado (GitHub Stock Watcher) ────────────────────────────────────
-    try:
-        senate_trades = _fetch_senate_github(years_back=1)
-        df_senate = pd.DataFrame(senate_trades) if senate_trades else pd.DataFrame()
-    except Exception as e:
-        errors.append(f"Senate Stock Watcher: {str(e)[:120]}")
-        df_senate = pd.DataFrame()
+    df_senate = pd.DataFrame(senate_trades) if senate_trades else pd.DataFrame()
+    df_house  = pd.DataFrame(house_trades)  if house_trades  else pd.DataFrame()
 
-    # ── 2. Cámara de Representantes (GitHub Stock Watcher) ──────────────────
-    try:
-        house_trades = _fetch_house_github(years_back=1)
-        df_house = pd.DataFrame(house_trades) if house_trades else pd.DataFrame()
-    except Exception as e:
-        errors.append(f"House Stock Watcher: {str(e)[:120]}")
-        df_house = pd.DataFrame()
-
-    # Combinar ambas cámaras
     parts = [df for df in [df_senate, df_house] if not df.empty]
     if parts:
         return pd.concat(parts, ignore_index=True)
 
+    # Nada funcionó — elevar con detalle para mostrar en UI
+    errors = [e for e in [senate_err, house_err] if e]
     raise ConnectionError(
         "No se pudieron cargar datos del Congreso:\n" + "\n".join(errors)
     )
@@ -781,8 +776,8 @@ def main():
 
         st.divider()
         st.markdown("**📡 Fuentes de datos:**")
-        st.markdown("• [Senate Stock Watcher](https://github.com/elemental-platform/senate-stock-watcher)")
-        st.markdown("• [House Stock Watcher](https://github.com/elemental-platform/house-stock-watcher)")
+        st.markdown("• [Senate Stock Watcher](https://github.com/timothycarambat/senate-stock-watcher-data)")
+        st.markdown("• [House Stock Watcher](https://github.com/timothycarambat/house-stock-watcher-data)")
         st.markdown("• [SEC EDGAR Form 4](https://www.sec.gov/cgi-bin/browse-edgar)")
         st.markdown("• [Dataroma](https://www.dataroma.com/m/ins/ins.php)")
         st.divider()
@@ -1066,8 +1061,8 @@ def main():
 **🏛️ Políticos del Congreso (STOCK Act)**
 - Todos los miembros del Congreso están obligados a declarar sus operaciones
   financieras en un plazo de **45 días** según el STOCK Act (2012).
-- **[Senate Stock Watcher](https://github.com/elemental-platform/senate-stock-watcher)** — mirror del Senado actualizado automáticamente *(sin clave, datos recientes)*
-- **[House Stock Watcher](https://github.com/elemental-platform/house-stock-watcher)** — mirror de la Cámara actualizado automáticamente *(sin clave, datos recientes)*
+- **[Senate Stock Watcher](https://github.com/timothycarambat/senate-stock-watcher-data)** — mirror del Senado actualizado automáticamente *(sin clave, datos recientes)*
+- **[House Stock Watcher](https://github.com/timothycarambat/house-stock-watcher-data)** — mirror de la Cámara actualizado automáticamente *(sin clave, datos recientes)*
 
 **💼 Insiders Corporativos (Form 4)**
 - CEOs, directores y ejecutivos deben reportar sus operaciones en **2 días hábiles**.
