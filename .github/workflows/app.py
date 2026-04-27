@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 import xml.etree.ElementTree as ET
 import re
 import time
+import json
 from bs4 import BeautifulSoup
  
 # ─────────────────────────────────────────────
@@ -201,22 +202,171 @@ def _normalize_fmp_congress(data: list, chamber: str) -> pd.DataFrame:
     return df
  
  
+def _scrape_capitoltrades(max_pages: int = 5) -> list[dict]:
+    """
+    Scrapes capitoltrades.com para obtener trades recientes del Congreso.
+    Capitol Trades es un agregador público que actualiza datos diariamente con información de 2026.
+ 
+    Estrategia:
+      1. Busca el blob JSON de Next.js (__NEXT_DATA__) embebido en el HTML.
+      2. Si no está, parsea la tabla HTML directamente.
+    """
+    trades: list[dict] = []
+ 
+    for page in range(1, max_pages + 1):
+        url = f"https://www.capitoltrades.com/trades?pageSize=96&page={page}"
+        try:
+            r = requests.get(url, headers=BROWSER_HEADERS, timeout=35)
+            if r.status_code != 200:
+                break
+ 
+            soup = BeautifulSoup(r.content, "html.parser")
+ 
+            # ── Método 1: datos embebidos por Next.js ──────────────────────
+            script_tag = soup.find("script", {"id": "__NEXT_DATA__"})
+            if script_tag and script_tag.string:
+                next_data = json.loads(script_tag.string)
+                page_props = next_data.get("props", {}).get("pageProps", {})
+ 
+                # Capitol Trades puede guardar los trades en distintos paths
+                trade_list = (
+                    page_props.get("trades") or
+                    page_props.get("data", {}).get("trades") or
+                    page_props.get("initialData", {}).get("trades") or
+                    []
+                )
+ 
+                if trade_list:
+                    for t in trade_list:
+                        # El objeto politician puede ser un dict anidado
+                        pol = t.get("politician") or {}
+                        if isinstance(pol, str):
+                            pol_name = pol
+                            pol_party = t.get("party", "")
+                            pol_chamber = t.get("chamber", "")
+                            pol_state = t.get("state", "")
+                        else:
+                            pol_name   = pol.get("name", "") or pol.get("fullName", "")
+                            pol_party  = pol.get("party", "") or t.get("party", "")
+                            pol_chamber = pol.get("chamber", "") or t.get("chamber", "")
+                            pol_state  = pol.get("state", "") or t.get("state", "")
+ 
+                        trades.append({
+                            "name":             pol_name,
+                            "party":            pol_party,
+                            "chamber":          pol_chamber,
+                            "state":            pol_state,
+                            "ticker":           t.get("ticker", "") or t.get("assetTicker", ""),
+                            "asset_description": (t.get("assetDescription") or
+                                                  t.get("asset", {}).get("assetDescription", "") or
+                                                  t.get("company", "")),
+                            "trade_type":       t.get("transactionType", "") or t.get("type", ""),
+                            "transaction_date": t.get("tradeDate", "") or t.get("txDate", "") or t.get("date", ""),
+                            "disclosure_date":  t.get("filedDate", "") or t.get("reportDate", "") or t.get("filed", ""),
+                            "amount_range":     t.get("amount", "") or t.get("size", "") or t.get("range", ""),
+                        })
+                    time.sleep(0.5)
+                    continue  # Siguiente página
+ 
+            # ── Método 2: tabla HTML ───────────────────────────────────────
+            table = soup.find("table")
+            if not table:
+                break  # Sin datos → detener paginación
+ 
+            headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
+ 
+            def col_idx(*keys):
+                for k in keys:
+                    for i, h in enumerate(headers):
+                        if k in h:
+                            return i
+                return None
+ 
+            idx_name    = col_idx("politician", "name", "representative", "senator")
+            idx_ticker  = col_idx("ticker", "symbol", "stock")
+            idx_type    = col_idx("type", "transaction", "action", "trade")
+            idx_txdate  = col_idx("traded", "trade date", "transaction date")
+            idx_filed   = col_idx("filed", "report", "disclosure date")
+            idx_amount  = col_idx("amount", "size", "value", "range")
+            idx_party   = col_idx("party")
+            idx_chamber = col_idx("chamber")
+            idx_asset   = col_idx("asset", "company", "description")
+ 
+            for row in table.find_all("tr")[1:]:
+                cells = row.find_all("td")
+                if not cells:
+                    continue
+ 
+                def get(idx, default=""):
+                    return cells[idx].get_text(strip=True) if idx is not None and idx < len(cells) else default
+ 
+                trades.append({
+                    "name":             get(idx_name),
+                    "ticker":           get(idx_ticker),
+                    "trade_type":       get(idx_type),
+                    "transaction_date": get(idx_txdate),
+                    "disclosure_date":  get(idx_filed),
+                    "amount_range":     get(idx_amount),
+                    "party":            get(idx_party),
+                    "chamber":          get(idx_chamber),
+                    "asset_description": get(idx_asset),
+                })
+ 
+            time.sleep(0.5)
+ 
+        except Exception:
+            break
+ 
+    return trades
+ 
+ 
 @st.cache_data(ttl=7200, show_spinner=False)
 def load_congress_trades(quiver_key: str = "", fmp_key: str = "") -> pd.DataFrame:
     """
     Carga trades del Congreso (Senado + Cámara de Representantes).
  
     Orden de fuentes:
-      1. Quiver Quantitative API — ambas cámaras + partido, requiere clave gratuita
-      2. GitHub Senate Stock Watcher (timothycarambat) — solo Senado, gratis sin clave
-      3. Financial Modeling Prep (FMP) — requiere clave gratuita
+      1. Capitol Trades (capitoltrades.com) — datos 2026 en tiempo real, sin clave
+      2. Quiver Quantitative API — datos históricos hasta ~2020, requiere clave
+      3. GitHub Senate Stock Watcher — solo Senado, datos hasta ~2023
     TTL: 2 horas
     """
     errors = []
  
-    # ── 1. Quiver Quantitative (fuente principal) ─────────────────────────
-    # Endpoint gratuito con registro en quiverquant.com
-    # Devuelve AMBAS cámaras + partido político en una sola llamada.
+    # ── 1. Capitol Trades (fuente principal — datos 2026 actualizados) ────
+    # Sitio público que agrega datos oficiales del Congreso diariamente.
+    # No requiere clave. Incluye Senado + Cámara + partido político.
+    try:
+        ct_trades = _scrape_capitoltrades(max_pages=5)
+        if ct_trades and len(ct_trades) > 10:
+            df = pd.DataFrame(ct_trades)
+            # Mapear cámara a español
+            if "chamber" in df.columns:
+                df["chamber"] = df["chamber"].str.strip().map({
+                    "House":   "Cámara de Representantes",
+                    "Senate":  "Senado",
+                    "house":   "Cámara de Representantes",
+                    "senate":  "Senado",
+                }).fillna(df["chamber"])
+            else:
+                df["chamber"] = "Congreso"
+            # Mapear partido a español
+            if "party" in df.columns:
+                df["party"] = df["party"].str.strip().map({
+                    "D":          "Demócrata",
+                    "R":          "Republicano",
+                    "I":          "Independiente",
+                    "Democrat":   "Demócrata",
+                    "Republican": "Republicano",
+                }).fillna(df["party"])
+            df["source"] = "Político"
+            # Limpiar filas sin ticker ni nombre
+            df = df[df["ticker"].astype(str).str.strip().ne("") | df["name"].astype(str).str.strip().ne("")]
+            return df
+    except Exception as e:
+        errors.append(f"Capitol Trades: {str(e)[:120]}")
+ 
+    # ── 2. Quiver Quantitative (datos históricos ~2020) ───────────────────
     if quiver_key:
         try:
             data = safe_fetch_json(
@@ -229,8 +379,7 @@ def load_congress_trades(quiver_key: str = "", fmp_key: str = "") -> pd.DataFram
         except Exception as e:
             errors.append(f"Quiver: {str(e)[:120]}")
  
-    # ── 2. GitHub Senate Stock Watcher (respaldo gratuito) ───────────────
-    # Solo Senado. Mantenido por la comunidad. Sin clave requerida.
+    # ── 3. GitHub Senate Stock Watcher (respaldo gratuito — solo Senado) ──
     for url in [
         "https://raw.githubusercontent.com/timothycarambat/senate-stock-watcher-data/master/aggregate/all_transactions.json",
         "https://raw.githubusercontent.com/rdumont/senate-stock-watcher-data/master/aggregate/all_transactions.json",
@@ -250,22 +399,6 @@ def load_congress_trades(quiver_key: str = "", fmp_key: str = "") -> pd.DataFram
                 return df
         except Exception as e:
             errors.append(f"GitHub Senate: {str(e)[:100]}")
- 
-    # ── 3. Financial Modeling Prep (respaldo con clave) ───────────────────
-    if fmp_key:
-        parts_fmp = []
-        for endpoint, chamber in [
-            (f"https://financialmodelingprep.com/api/v4/senate-trading?apikey={fmp_key}", "Senado"),
-            (f"https://financialmodelingprep.com/api/v4/house-trading?apikey={fmp_key}", "Cámara de Representantes"),
-        ]:
-            try:
-                data = safe_fetch_json(endpoint, timeout=30)
-                if data and isinstance(data, list) and len(data) > 0:
-                    parts_fmp.append(_normalize_fmp_congress(data, chamber))
-            except Exception as e:
-                errors.append(f"FMP {chamber}: {str(e)[:80]}")
-        if parts_fmp:
-            return pd.concat(parts_fmp, ignore_index=True)
  
     raise ConnectionError("Congreso — todas las fuentes fallaron:\n" + "\n".join(errors))
  
@@ -780,7 +913,7 @@ def main():
             except Exception:
                 fmp_key = ""
  
-            with st.spinner("⏳ Cargando datos del Congreso desde Quiver Quantitative..."):
+            with st.spinner("⏳ Cargando datos del Congreso desde Capitol Trades..."):
                 errors_cong = []
                 df_c_raw = pd.DataFrame()
  
@@ -804,24 +937,24 @@ def main():
                     cong_ok = True
  
                     # Banner informativo según fuente activa
-                    if quiver_key:
-                        if "chamber" in df_c.columns:
-                            n_senate = df_c["chamber"].str.contains("enado", na=False).sum()
-                            n_house  = df_c["chamber"].str.contains("mara|House|house", na=False).sum()
-                        else:
-                            n_senate = n_house = 0
-                        st.success(
-                            f"✅ Datos de **Quiver Quantitative** — "
-                            f"Senado: {n_senate:,} | Cámara: {n_house:,} transacciones"
-                        )
+                    if "chamber" in df_c.columns:
+                        n_senate = df_c["chamber"].str.contains("enado", na=False).sum()
+                        n_house  = df_c["chamber"].str.contains("mara|House|house", na=False).sum()
                     else:
-                        st.info(
-                            "ℹ️ Mostrando datos del **Senado** (respaldo). "
-                            "Para ver **ambas cámaras + partidos**, configura tu clave gratuita de "
-                            "[Quiver Quantitative](https://www.quiverquant.com/signup) "
-                            "en Streamlit Secrets → `QUIVER_API_KEY`. "
-                            "Ver instrucciones en la pestaña **ℹ️ Acerca de**."
-                        )
+                        n_senate = n_house = 0
+ 
+                    src = df_c["source"].iloc[0] if "source" in df_c.columns else "Desconocida"
+                    if "Capitol" in str(df_c.get("source", [""])[0] if len(df_c) > 0 else ""):
+                        fuente_label = "Capitol Trades"
+                    elif quiver_key:
+                        fuente_label = "Quiver Quantitative (histórico)"
+                    else:
+                        fuente_label = "GitHub Senate (respaldo)"
+ 
+                    st.success(
+                        f"✅ Fuente: **{fuente_label}** — "
+                        f"Senado: {n_senate:,} | Cámara: {n_house:,} transacciones"
+                    )
                     if errors_cong:
                         st.warning("⚠️ Datos parciales: " + " | ".join(errors_cong))
  
